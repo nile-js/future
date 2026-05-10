@@ -1,443 +1,432 @@
-# slang-ts
+# @nilejs/future
 
-Functional programming library for TypeScript.
-
-A collection of functional programming utilities and other cool programming stuff from other languages such as rust implemented in TypeScript.
+High-performance system-level actor and promise primitives for Bun and Node.js inspired by Erlang.
 
 ## Install
 
-```bash
-npm i slang-ts
+```
+npm install @nilejs/future
 ```
 
-## Implemented Utilities
+Requirements: Bun v1.0+ or Node.js v18+, TypeScript v4.5+ (for full type safety)
 
-- [x] Result (Ok, Err)
-- [x] Maybe (Option)
-- [x] andThen
-- [x] Atom
-- [x] Expect
-- [x] Unwrap (on Option)
-- [x] Else (on unwrap)
-- [x] Panic
-- [x] Zip, Unzip, zipWith
-- [x] SafeTry
-- [x] Match
-- [x] MatchAll
-- [x] Pipe
-- [x] To (converters, e.g. `userAtom.to('option')`)
+## Quick Example
 
-All utilities fully tested, See [tests](https://github.com/Hussseinkizz/slang/tree/main/tests)
+```typescript
+import { createSupervisor } from "@nilejs/future";
 
-## Others (Planned)
+const supervisor = createSupervisor({
+  maxActors: 10,
+  memory: { poolSize: 5, boxSize: '1mb' }
+});
 
-- Pubsub store with state locks
-- Promises and async utilities
+const actor = supervisor.spawn(async (self, msg, ctx) => {
+  const result = await processData(msg.input);
+  self.send({ type: 'DONE', result });
+});
+
+actor.spawn({ input: 'test' });
+actor.subscribe((msg) => match(msg, {
+  DONE: (m) => println('Result:', m.result),
+  _: () => {}
+}));
+```
+
+## The Problem
+
+What happens when your function hangs forever? When your agent enters an infinite loop? When your code crashes your entire backend?
+
+Standard JavaScript has no built-in protection against:
+- Infinite loops that hang your event loop
+- Functions that consume all memory
+- Unreleased resources from crashed code
+- Cascading failures that bring down your entire system
+
+## The Solution
+
+future isolates execution in separate threads with automatic cleanup:
+- Any actor can be terminated on demand
+- Hanging code is automatically killed via heartbeat timeout
+- Resource cleanup is guaranteed on termination
+- One actor's failure cannot corrupt others
+
+## Core Concepts
+
+### Supervisor
+
+A supervisor is the orchestrator that manages actor lifecycle. It creates actors, monitors their health, and handles failures according to configured strategies.
+
+```typescript
+const supervisor = createSupervisor({
+  maxActors: 10,
+  memory: { poolSize: 5, boxSize: '1mb' },
+  resources: { /* resource definitions */ }
+});
+```
+
+The supervisor provides:
+- Actor creation and lifecycle management
+- Heartbeat and lease monitoring
+- Resource allocation and cleanup
+- Failure handling and supervision strategies
+
+### What is an Actor?
+
+An actor is an isolated execution context running in a separate thread. Actors communicate via messages and can share data through shared memory.
+
+```typescript
+const actor = supervisor.spawn(async (self, msg, ctx) => {
+  // self: actor control (send messages)
+  // msg: incoming message data
+  // ctx: execution context (resources, locks, formatting)
+});
+```
+
+Each actor has:
+- Isolated memory and event loop
+- Lifecycle tied to supervisor
+- Ability to send messages and spawn children
+- Access to resources via proxy
+
+### Context (ctx)
+
+The context is injected into every actor callback. It provides everything the actor needs to function:
+
+```typescript
+// Resources (proxy to main-thread services)
+ctx.resources.db.query({ sql: 'SELECT * FROM users' });
+
+// Lock acquisition for shared memory
+const lock = await ctx.acquireLock();
+ctx.deposit(lock, data);
+ctx.done(lock);
+
+// Formatting utilities (no need to import)
+const buffer = ctx.fmt.alloc(1024);
+const encoded = ctx.fmt.encode({ key: 'value' });
+
+// Actor control
+ctx.heartbeat();      // Keep lease alive during long operations
+ctx.terminate();      // Terminate self
+ctx.isCancelled;      // Check if terminated
+```
+
+### Communication: Two-Tier System
+
+Communication happens in two tiers:
+
+**Tier 1 (Control)**: Lightweight signals via postMessage
+- Small messages, status updates, heartbeats
+- Resource method calls (intent relay)
+- PubSub pattern for subscribers
+
+**Tier 2 (Data)**: Zero-copy shared memory
+- Large data transfers without serialization
+- Atomic operations for lock-free access
+- Memory pool with fixed-size boxes
+
+```typescript
+// Tier 1: Send a signal
+self.send({ type: 'PROGRESS', value: 0.5 });
+
+// Tier 2: Share large data
+const lock = await ctx.acquireLock();
+ctx.deposit(lock, largeDataArray);
+ctx.done(lock);
+```
+
+## Key Features
+
+**Fault Tolerance and Safety**
+- Automatic lease system that terminates stalled actors
+- Configurable heartbeat timeouts to detect hung code
+- On-demand actor termination from userland code
+- Isolation prevents one actor crash from affecting others
+- Resource cleanup guarantees on actor termination
+
+**Concurrency and Parallelism**
+- Two-tier communication: lightweight signals and zero-copy data transfer
+- Memory pool with FIFO queuing prevents lock contention
+- Shared memory enables efficient large data sharing between actors
+
+**Execution Safety**
+- Actor callbacks are serialized, outer scope is not inherited
+- All state must be passed via message or accessed through context
+- This isolation enables safe concurrent execution and termination
+
+**Formatting Utilities (ctx.fmt)**
+- Buffer allocation without thinking about Uint8Array
+- Automatic encoding and decoding (JSON, string, binary)
+- Available directly on context, no separate imports
+- Typed allocations for common data types
+
+## Erlang Inspired
+
+future draws from Erlang's proven concurrency model:
+
+**Let It Crash**: Rather than defensive programming, actors can fail and the supervisor handles recovery. Code does not need to handle every possible error state.
+
+**Supervision Trees**: Actors are organized hierarchically. When a parent fails, children are handled according to the supervision strategy.
+
+**Actor Isolation**: Each actor has its own memory and cannot corrupt others. Failures are contained.
+
+**Linking**: Actors can be linked so that when one dies, others are terminated. This creates "suicide pacts" for dependent actors.
+
+**Monitoring**: Actors can monitor others without linking. When a monitored actor dies, the watcher receives a notification.
+
+Supervision strategies:
+- **one-for-one**: Restart only the failed actor
+- **one-for-all**: Restart all actors in the group
+- **rest-for-one**: Restart actors started after the failed one
+
+## slang-ts Integration
+
+[slang-ts](https://github.com/Hussseinkizz/slang) is an external TypeScript library that provides functional patterns. All code uses slang-ts patterns for cleaner, safer code:
+
+```typescript
+// match instead of if/switch
+match(result, {
+  Ok: (v) => process(v),
+  Err: (e) => handle(e),
+});
+
+// matchAll for tagged unions
+matchAll(msg, {
+  PROGRESS: (m) => println(m.value),
+  ERROR: (e) => println(e.message),
+  _: () => {}  // Default case
+});
+
+// Result types for explicit error handling
+const lock = await ctx.acquireLock();
+match(lock, {
+  Ok: (l) => { /* use lock */ },
+  Err: (e) => println('Pool exhausted'),
+});
+```
+
+This replaces imperative control flow with declarative pattern matching.
+
+## Resource Manager
+
+Resources are services available to actors but running on the main thread. The Resource Manager provides safe access through intent relay.
+
+```typescript
+const supervisor = createSupervisor({
+  resources: {
+    database: {
+      query: {
+        input: z.object({ sql: z.string() }),
+        output: z.array(z.unknown()),
+        handler: async ({ sql }) => await db.query(sql)
+      },
+      release: async () => await db.close()
+    }
+  }
+});
+
+// Actor uses resource
+const results = await ctx.resources.database.query({ sql: 'SELECT 1' });
+```
+
+How it works:
+1. Actor calls `ctx.resources.db.query(...)`
+2. Proxy intercepts and sends intent to main thread
+3. Main thread executes the handler
+4. Result is sent back to actor
+
+Benefits:
+- Database connections stay on main thread
+- Resource access is validated via Zod schemas
+- Resources are cleaned up on shutdown via release hooks
+- Actors cannot directly access shared state
 
 ## How It Works
 
-You can import utilities individually or together:
+```typescript
+import { createSupervisor } from "@nilejs/future";
 
-```ts
-// Individual imports
-import { option } from "slang-ts";
-import { Ok, Err } from "slang-ts";
+// Actor callbacks are serialized, outer scope is NOT available
+const config = { timeout: 5000 };
+const sharedData = heavyPayload;
 
-// Or import multiple at once
-import { option, Ok, Err, atom, match } from "slang-ts";
+// WRONG: outer scope is lost on serialization
+const actor = supervisor.spawn(async (self, msg, ctx) => {
+  // config === undefined
+  // sharedData === undefined
+});
 
-// Or import under namespace (not so performant)
-import * as slang from "slang-ts";
+// RIGHT: pass state via msg
+const actor = supervisor.spawn(async (self, msg, ctx) => {
+  const timeout = msg.timeout;  // From message
+  const data = await ctx.resources.storage.get(msg.dataId);  // From resources
 
-slang.println("Hello world!");
-```
-
-### Option
-
-Wraps values that may or may not be present. Returns `Some<T>` for truthy values, `None` for null, undefined, empty strings, NaN, or Infinity. Note that `0` and `false` are truthy as these are usually intentional.
-
-```ts
-import { option } from "slang-ts";
-
-const a = option("hi");      // Some("hi")
-const b = option(null);      // None
-const c = option(0);         // Some(0) - zero is truthy!
-const d = option("");        // None
-const e = option(false);     // Some(false) - false is truthy!
-
-if (a.isSome) {
-  println("Value:", a.value);
-}
-
-if (b.isNone) {
-  println("No value");
-}
-```
-
-### Result
-
-Represents operations that can succeed or fail. Returns `Ok<T>` on success or `Err<E>` on failure with typed error payload.
-
-```ts
-import { Ok, Err, type Result } from "slang-ts";
-
-// Simple function returning Result
-function divide(a: number, b: number): Result<number, string> {
-  if (b === 0) return Err("Cannot divide by zero");
-  return Ok(a / b);
-}
-
-const result = divide(10, 2);
-
-if (result.isOk) {
-  println("Success:", result.value); // 5
-} else {
-  println("Error:", result.error);
-}
-
-// Async API example
-interface User {
-  id: string;
-  name: string;
-}
-
-async function fetchUser(id: string): Promise<Result<User, string>> {
-  try {
-    const response = await fetch(`/api/users/${id}`);
-    if (!response.ok) return Err("User not found");
-    const user = await response.json();
-    return Ok(user);
-  } catch (error) {
-    return Err("Network error");
+  // Heavy processing with heartbeat
+  for (let i = 0; i < data.length; i++) {
+    process(data[i]);
+    if (i % 1000 === 0) ctx.heartbeat();
   }
-}
 
-const user = await fetchUser("123");
-if (user.isOk) {
-  println("User:", user.value.name);
-}
-```
-
-### Atom
-
-Creates unique, non-interned symbols with semantic descriptions. Each call produces a distinct identity. So ideally define them in one file and import from it everywhere else, great for env variables stuff.
-
-```ts
-import { atom } from "slang-ts";
-
-const userAtom = atom("kizz");
-const user2Atom = atom("kizz");
-
-println(userAtom === atom("kizz")); // false - non interned ✅
-println(userAtom.description);      // "kizz"
-
-if (userAtom === user2Atom) {
-  println("all the same");
-} else {
-  println("not the same");          // This prints!
-}
-```
-
-### Match
-
-Exhaustive pattern matching for `Option` and `Result` types. Forces you to handle all cases. Returns the value from the matched handler.
-
-```ts
-import { match } from "slang-ts";
-
-// Matching Results - returns handler result
-const result = divide(10, 0);
-const message = match(result, {
-  Ok: (v) => `Success: ${v.value}`,
-  Err: (e) => `Failed: ${e.error}`,
+  self.send({ type: 'COMPLETE' });
 });
-println(message); // "Failed: Cannot divide by zero"
 
-// Matching Options - returns handler result
-const maybePort = option(process.env.PORT);
-const port = match(maybePort, {
-  Some: (v) => parseInt(v.value),
-  None: () => 3000,
+// Spawn with state
+actor.spawn({ timeout: 5000, dataId: 'abc123' });
+
+// Subscribe to messages
+actor.subscribe((msg) => {
+  match(msg, {
+    COMPLETE: () => println('Done'),
+    _: () => {}
+  });
 });
-println("Using port:", port); // Uses parsed port or default 3000
+
+// Terminate on demand - CODE STOPS IMMEDIATELY
+// This is NOT AbortController which just ignores results
+// This is TRUE termination, the thread is killed
+actor.terminate();
 ```
 
-### MatchAll
+## Termination vs AbortController
 
-Pattern matching for primitives and atoms with required `_` fallback. Returns the value from the matched handler.
+This is NOT the same as AbortController.
 
-```ts
-import { matchAll } from "slang-ts";
+AbortController just ignores results, the execution continues running in the background until completion. It does not stop anything.
 
-// Match atoms - returns handler result
-const ready = atom("ready");
-const status = matchAll(ready, {
-  ready: () => "System is ready",
-  failed: () => "System failed",
-  _: () => "Unknown state",
+Actor termination in future kills the thread immediately. The execution stops right there. Resources are cleaned up. This is true termination.
+
+Most libraries in TypeScript and JavaScript cannot do this. future and Effect-TS are among the few that support true on-demand termination of running code.
+
+## Shared Memory
+
+Zero-copy data transfer between actors:
+
+```typescript
+const producer = supervisor.spawn(async (self, msg, ctx) => {
+  const lock = await ctx.acquireLock();
+  const buffer = ctx.fmt.alloc(msg.size);
+
+  // Write data directly to shared buffer
+  for (let i = 0; i < msg.size; i++) {
+    buffer[i] = computeValue(i);
+  }
+
+  ctx.deposit(lock, buffer);
+  ctx.done(lock);
+  self.send({ type: 'READY' });
 });
-println(status); // "System is ready"
 
-// Match booleans - returns handler result
-const isActive = true;
-const label = matchAll(isActive, {
-  true: () => "Active",
-  false: () => "Inactive",
-  _: () => "Unknown",
+producer.spawn({ size: 1000000 });
+```
+
+## Supervision
+
+Resilient actor hierarchies:
+
+```typescript
+const pipeline = supervisor.createGroup({
+  strategy: 'rest-for-one'  // Restart downstream on upstream failure
 });
-println(label); // "Active"
-```
 
-### Expect
+const ingest = pipeline.spawn(async (self, msg, ctx) => {
+  const data = await ctx.resources.http.get(msg.url);
+  const lock = await ctx.acquireLock();
+  ctx.deposit(lock, data);
+  ctx.done(lock);
+  self.send({ type: 'INGESTED' });
+});
 
-Unwraps values or throws with custom message. Use when failure is unrecoverable.
-
-```ts
-const personAge = option(25).expect("a person must have age!");
-println("person age", personAge); // 25
-
-// This would throw!
-// const personAge2 = option("").expect("a person must have age!");
-```
-
-### Unwrap/Else
-
-Chainable unwrapping with mandatory fallback. Must call `.else()` or throws.
-
-```ts
-const port = option(process.env.PORT).unwrap().else(3000);
-println("Using port:", port);
-
-// Function fallbacks
-const retries = option(null).unwrap().else(() => 5);
-println("Retries:", retries);
-
-// This throws! No .else() chained
-// const nothing = option(null).unwrap();
-```
-
-### To
-
-Converts between Slang types.
-
-```ts
-const statusAtom = atom("active").to("option");
-println("Option:", statusAtom);           // Some("active")
-
-const stateOption = option("ready").to("atom");
-println("Atom:", stateOption.description); // "ready"
-
-const errResult = option(null).to("result");
-println("Result:", errResult.type);        // "Err"
-```
-
-### andThen
-
-Chainable transformation for `Option`, `Result`, and `Atom`. Transforms the inner value while preserving the wrapper type. Returns original instance if provided transformation function returns `undefined`.
-
-```ts
-// Option - transforms Some, skips None
-option(5).andThen(x => x * 2);              // Some(10)
-option(null).andThen(x => x * 2);           // None (skipped)
-option(5).andThen(() => undefined);         // Some(5) - original
-
-// Result - transforms Ok, skips Err
-Ok(10).andThen(x => x + 5);                 // Ok(15)
-Err("fail").andThen(x => x + 5);            // Err("fail") (skipped)
-
-// Atom - transforms description (sync only)
-atom("hello").andThen(s => s.toUpperCase()); // Atom("HELLO")
-
-// Chained andThen - multiple transformations
-option(5)
-  .andThen(x => x + 1)
-  .andThen(x => x * 2)
-  .andThen(x => x.toString());              // Some("12")
-
-Ok(10)
-  .andThen(x => x * 2)
-  .andThen(x => x + 5)
-  .andThen(x => ({ value: x }));            // Ok({ value: 25 })
-
-atom("hello")
-  .andThen(s => s.toUpperCase())
-  .andThen(s => s + "!");                   // Atom("HELLO!")
-
-// Async support for Option and Result
-const data = await option(5).andThen(async x => await fetchData(x));
-
-// Error handling
-option(5).andThen(() => { throw "oops" });  // None (caught)
-Ok(5).andThen(() => { throw "oops" });      // Err("oops")
-atom("x").andThen(() => { throw "oops" });  // Panics!
-
-// Type transformation
-option(42).andThen(x => x.toString());      // Some("42")
-```
-
-### Zip
-
-Combines multiple collections element-wise into tuples.
-
-```ts
-import { zip } from "slang-ts";
-
-// Zip arrays
-const arr1 = [1, 2, 3];
-const arr2 = [4, 5, 6];
-const arr3 = [7, 8, 9];
-println(zip([arr1, arr2, arr3]));
-// [[1,4,7],[2,5,8],[3,6,9]]
-
-// Zip with fillValue
-println(zip([arr1, [10, 20]], { fillValue: 0 }));
-// [[1,10],[2,20],[3,0]]
-
-// Zip Sets with includeValues=true
-const s1 = new Set([10, 20, 30]);
-const s2 = new Set([100, 200, 300]);
-println(zip([s1, s2], { includeValues: true }));
-// [[10,100],[20,200],[30,300]]
-
-// Zip objects with includeValues=true
-const o1 = { a: 1, b: 2, c: 3 };
-const o2 = { x: 100, y: 200, z: 300 };
-println(zip([o1, o2], { includeValues: true }));
-// [[1,100],[2,200],[3,300]]
-```
-
-### ZipWith
-
-Combines collections and applies transform function to each tuple.
-
-```ts
-import { zipWith } from "slang-ts";
-
-const arr1 = [1, 2, 3];
-const arr2 = [4, 5, 6];
-const arr3 = [7, 8, 9];
-
-println(zipWith([arr1, arr2, arr3], (t) => t.reduce((sum, x) => sum + x, 0)));
-// [12, 15, 18]
-```
-
-### Unzip
-
-Reverses zip operation, separating tuples back into arrays.
-
-```ts
-import { unzip } from "slang-ts";
-
-const arr1 = [1, 2, 3];
-const arr2 = [4, 5, 6];
-
-const zipped = zip([arr1, arr2]);
-println(unzip(zipped));
-// [[1, 2, 3], [4, 5, 6]]
-```
-
-### Pipe
-
-Sequential function composition where each function receives a `Result` and returns a `Result`. Accepts plain values, Option, Result, or Atom as initial input.
-
-```ts
-import { pipe, Ok, Err, option, type Result } from "slang-ts";
-
-// Create pipeline functions
-const add = (x: number) => (res: Result<number, string>) =>
-  res.isOk ? Ok(res.value + x) : res;
-
-const multiply = (x: number) => (res: Result<number, string>) =>
-  res.isOk ? Ok(res.value * x) : res;
-
-// Basic usage
-const result = await pipe(5, add(3), multiply(2)).run();
-println("Result:", result.value); // 16
-
-// With Options as initial value
-const fromOption = await pipe(option(10), add(5)).run();
-println("From option:", fromOption.value); // 15
-
-// With callbacks and error handling
-const result = await pipe(5, add(3), multiply(2)).run({
-  onEach: ({ currentFn, prevResult }) => {
-    println("Executed:", currentFn);
-  },
-  onSuccess: (value) => println("Done:", value),
-  onError: (err) => println("Failed:", err.message),
-  allowErrors: false, // stops pipeline on first Err
+const transform = pipeline.spawn(async (self, msg, ctx) => {
+  match(msg, {
+    INGESTED: async () => {
+      const data = pipeline.read(msg.address);
+      const result = transformData(data);
+      self.send({ type: 'TRANSFORMED', data: result });
+    },
+    _: () => {}
+  });
 });
 ```
 
-### SafeTry
+## Constraints
 
-Wraps potentially throwing functions in try-catch, returning a `Result<T, string>`. Always needs to be awaited as its async.
+When using future, keep these constraints in mind:
 
-```ts
-import { safeTry } from "slang-ts";
+**Data Transfer**
+- Arguments and return values must be cloneable (JSON-compatible or Uint8Array)
+- Large data should use Tier 2 addresses rather than serialization
+- Resource methods must declare input and output validation schemas
 
-const result = await safeTry(() => {
-  if (denom === 0) throw new Error("Cannot divide by zero");
-  return num / denom;
-});
+**Execution Model**
+- Actor callbacks are serialized, outer scope is not available
+- All state must be passed via message or accessed through context
+- Heartbeat timeout defaults to 5000 milliseconds (configurable)
 
-if (result.isOk) {
-  println("Result:", result.value);
-} else {
-  println("Error:", result.error);
-}
+**Configuration Required**
+- Memory pool requires explicit poolSize and boxSize configuration
+- Resources must define input and output schemas
+- Supervision strategy must be chosen for actor groups
 
-// Async functions work the same way
-const data = await safeTry(async () => {
-  const res = await fetch("/api/user");
-  return res.json();
-});
+## Performance Characteristics
 
-if (data.isOk) {
-  println("User:", data.value);
-}
+**Concurrency Model**
+- N isolated threads with their own event loops
+- Lock-free memory allocation using atomic compare-exchange operations
+- FIFO queuing ensures fair resource access without starvation
+- Heartbeat system enables automatic recovery from stalled execution
 
-// Re-throw critical errors instead of capturing
-await safeTry(() => {
-  throw new Error("Critical!");
-}, { throw: true });
-```
+**Fault Tolerance**
+- Lease expiration prevents indefinite resource holding
+- Supervision strategies (one-for-one, one-for-all, rest-for-one) control failure blast radius
+- Linking enables cascading termination for dependent actors
+- Monitoring provides failure notification without forced termination
+- Resource isolation prevents main-thread crashes from affecting actors
 
-### Panic
+**Isolation Guarantees**
+- Each actor runs in separate thread with isolated memory space
+- Resource access mediated through serialized intent packets
+- Memory access controlled through atomic operations only
+- Actor termination includes guaranteed buffer cleanup
+- Failure domains bounded by supervision tree structure
 
-Throws an error immediately. Use for unrecoverable failures.
+## Use Cases
 
-```ts
-import { panic } from "slang-ts";
+future is ideal for:
 
-function processUser(user: User | null) {
-  if (!user) panic("User cannot be null");
-  return user.name;
-}
+**AI Agent Systems**
+- Running agents that can hang or enter infinite loops
+- Sharing large context windows between agents
+- Managing multi-agent workflows with dependencies
+- Streaming token generation that must be interruptible
 
-// Guard clause pattern
-const config = loadConfig();
-if (!config.apiKey) panic("API key required");
-```
+**Data Processing Pipelines**
+- Parallel transformation stages that should not block each other
+- ETL workflows requiring resilience to individual stage failures
+- Media processing (image, video, audio) with isolated actors
+- Real-time data enrichment with automatic cleanup
 
-### println
+**Background Job Processing**
+- Jobs that must be cancellable on demand
+- Queue systems where job failures should not halt processing
+- Long-running tasks with configurable timeout and retry
+- Resource cleanup guarantees when jobs complete or fail
 
-Well there's nothing special to slang's println utility, its just who wants console.log, its not fun at all, so we instead println, clean and classic, but latter it can be made environment aware so it doesn't print in prod, but for now its just sugar for console.log.
+**Safe Code Execution**
+- Running untrusted or unpredictable code
+- Plugins or extensions with limited trust
+- Sandboxed execution environments
+- Any scenario where hanging code must be killed safely
 
-```ts
-import { println } from "slang-ts";
-
-const name = "kizz";
-println("name:", name);
-println("multiple", "args", "work", { too: true });
-```
-
-And more are to be implemented in coming versions...
-
-## Code Samples
-
-See [example.ts](https://github.com/Hussseinkizz/slang/blob/main/example.ts) for usage of currently implemented methods.
+---
 
 ## Contributing
 
-Contributions are welcome, I know there a lot of cool things out there we can bring in.
+Contributions are welcome. This is an open source project.
+
+## License
+
+MIT License
+
+## Status
+
+This project is work in progress. APIs may change as the library evolves.

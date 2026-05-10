@@ -1,6 +1,6 @@
 # Copywriting Rules
 
-Rules for all user-facing copy across Nylon Pay.
+Rules for all user-facing copy across project.
 
 ## Language
 
@@ -9,7 +9,7 @@ Rules for all user-facing copy across Nylon Pay.
 - No emojis
 - No abbreviations, use full words (developers not devs, company not co.)
 - Avoid risky or harsh terms like "legal" or "skip", use softer alternatives like "registered" or "reduce"
-- Don't include unnecessary technical details like we use Zod for validation, just say "validation" or "schema validation" or don't say we use HMAC algorithm for encryption, just say "secure encryption" etc.
+- Don't include unnecessary technical details like we use Zod for validation, just say "validation" or "schema validation" or don't say we use HMAC algorithm for encryption, just say "secure encryption" etc unless it's a purely technical document.
 
 ## Tone
 
