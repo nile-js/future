@@ -1,4 +1,4 @@
-# @nilejs/future
+# Future
 
 High-performance system-level actor and promise primitives for Bun and Node.js inspired by Erlang.
 
