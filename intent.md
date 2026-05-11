@@ -1,32 +1,54 @@
-# Intent: Fix AGENTS.md Audit Violations
+# Intent: Align Codebase with spec-final.md Architecture
 
-## What
-Fix all code style violations found in the audit of `src/future/`.
+## What We're Changing
 
-## Why
-AGENTS.md mandates: no `any`, no raw try/catch, no `switch`, named params, max 400 LOC, JSDoc for public APIs.
+The current codebase implements an older actor system API. We are aligning it with the canonical spec-final.md which defines a Two-Tier actor model with immutable SAB boxes, supervisor-side state tracking, per-actor inbox queues, authorization, and a cleaner DSL.
+
+## Files Being Modified
+
+### Core Rewrites
+- `src/future/types.ts` — New type contracts: `Lock` with epoch, `BoxEntry`, `InboxEntry`, `ShareConfig`, new `Message` shape, new `ActorContext` API, new `ActorRef` API
+- `src/future/memory-pool.ts` — Remove SAB state board and lease tracker. SAB becomes raw byte storage only. Remove all Atomics/CAS operations.
+- `src/future/supervisor.ts` — Major rewrite: maintain `BoxEntry[]` parallel to data boxes, per-actor inbox queues (`Map<ActorId, InboxEntry[]>`), FIFO write queue, authorization checks, epoch validation, opportunistic lease cleanup, INBOX protocol delivery, proper TERMINATE_CHILD handling
+- `src/future/worker-bootstrap.ts` — New APIs: `ctx.write({ msg, type, data, share })` single call, `ctx.read(m)` returning chainable decoder, `ctx.release(handle)`, `self.send(msg, data?)`, proper `from` injection
+- `src/future/actor.ts` — `actor.read(m)` returning chainable decoder, `actor.release(handle)` replacing `actor.done(lock)`
+
+### Supporting Changes
+- `src/future/diagnostics.ts` — Add `writeQueueDepth`, `authorizationEvents`, `inboxDepth`, `refCountHistory`, `processLifetimes` tracking. Measure actual lock acquisition wait times and resource call durations with `performance.now()`.
+- `src/future/group-manager.ts` — Ensure group membership is available for `ShareConfig` "group" authorization
+- `src/future/resource-manager.ts` — Measure actual handler execution duration for `recordResourceCall`
+
+### Test Rewrites
+- `tests/future/supervisor.spec.ts` — Complete rewrite using new APIs
+- `tests/future/memory-pool.spec.ts` — Rewrite for raw-data SAB pool
+- `tests/future/diagnostics.spec.ts` — Update for new metrics
+- `tests/future/group-manager.spec.ts` — Verify group auth works
+- `tests/future/restart.spec.ts` — Verify still passes
+- `tests/future/resource-manager.spec.ts` — Verify latency tracking
 
 ## How
-1. Fix `any` → `unknown` in types.ts + remove `as any` in strategies.ts
-2. Convert raw `try/catch` → `safeTry` in 4 locations
-3. Convert `switch` → object lookup in 3 locations
-4. Convert positional params → named params in 4 exported functions
-5. Add JSDoc to 16 missing types in types.ts
-6. Update all callers/tests for breaking changes
-7. Typecheck + run full test suite
+
+1. Rewrite types first (foundation)
+2. Rewrite memory pool (no state in SAB)
+3. Rewrite supervisor (BoxEntry[], inbox, write queue, auth)
+4. Rewrite worker bootstrap (new ctx API)
+5. Update actor ref
+6. Update diagnostics, group manager, resource manager
+7. Rewrite tests
+8. Run full suite
 
 ## Expected Impact
-- All source files pass AGENTS.md style rules
-- Tests updated to match new signatures
-- 344 tests continue to pass
-- No functional behavior changes (pure refactoring)
 
-## Files to Modify
-- `src/future/types.ts` — `any` → `unknown`, add JSDoc
-- `src/future/strategies.ts` — remove `as any`, switch→lookup, positional→named
-- `src/future/restart.ts` — positional→named
-- `src/future/supervisor.ts` — try/catch→safeTry (2), switch→lookup
-- `src/future/worker-bootstrap.ts` — try/catch→safeTry (1), switch→lookup
-- `src/future/resource-manager.ts` — try/catch→safeTry (1)
-- `src/future/group-manager.ts` — update callers for named params
-- `tests/future/*.spec.ts` — update for breaking changes
+- Breaking API changes: `acquireLock`/`deposit`/`done` → `ctx.write`. `ctx.read(lock)` async → `ctx.read(m)` sync chainable. `actor.done(lock)` → `actor.release(handle)`.
+- All existing future tests will need rewriting. Slang tests should be unaffected.
+- SAB memory layout changes: state board and lease tracker removed. Box indices remain the same but state is tracked off-SAB.
+- Lock shape changes: `{ boxIndex, epoch }` instead of `{ boxIndex, byteOffset, length }`.
+
+## Invariants to Preserve
+- A box in WRITING state has exactly one writer
+- A box in READY state has immutable data
+- refCount must reach 0 before FREE transition
+- `from` is always auto-injected by supervisor
+- No unauthorized message delivery
+- Epoch prevents use-after-free on recycled boxes
+- SAB is raw data only — no state metadata

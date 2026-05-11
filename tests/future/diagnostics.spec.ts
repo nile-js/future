@@ -11,8 +11,6 @@ const mockState: InternalActorState = {
   lastHeartbeatAt: Date.now(),
   messagesSent: 10,
   subscribers: new Set(),
-  locks: new Set(),
-  reads: new Set(),
   linkedActors: new Set(),
   monitoredActors: new Set(),
   terminated: false,
@@ -37,7 +35,7 @@ describe("diagnostics", () => {
       c.recordActorStart("a");
       c.recordActorHeartbeat("a");
       c.recordActorMessage("a");
-      c.recordLockAcquisition(5);
+      c.recordWriteQueueWait(5);
       c.recordResourceCall(3);
       const d = c.buildActorDiagnostics("a", mockState);
       expect(d.lifetimeMs).toBeGreaterThanOrEqual(0);
@@ -74,16 +72,93 @@ describe("diagnostics", () => {
       expect(d.messageCount).toBe(2);
     });
 
-    it("tracks lock acquisition when lockAcquisitionTimes enabled", () => {
-      const c = createDiagnosticsCollector(enabledConfig({ lockAcquisitionTimes: true }));
-      c.recordLockAcquisition(12);
-      c.recordLockAcquisition(8);
+    it("tracks write queue wait when writeQueueWait enabled", () => {
+      const c = createDiagnosticsCollector(enabledConfig({ writeQueueWait: true }));
+      c.recordWriteQueueWait(12);
+      c.recordWriteQueueWait(8);
       const diag = c.buildSupervisorDiagnostics({
         activeActors: 1, totalSpawned: 1, totalTerminated: 0,
         poolSize: 10, boxesInUse: 2, actors: [],
       });
       expect(diag.activeActors).toBe(1);
       expect(diag.memoryPool.utilization).toBe(0.2);
+      expect(diag.writeQueueWait).toBeDefined();
+      expect(diag.writeQueueWait!.avgMs).toBe(10);
+      expect(diag.writeQueueWait!.maxMs).toBe(12);
+      expect(diag.writeQueueWait!.totalWaits).toBe(2);
+    });
+
+    it("tracks write queue depth when writeQueueDepth enabled", () => {
+      const c = createDiagnosticsCollector(enabledConfig({ writeQueueDepth: true }));
+      c.recordWriteQueueDepth(3);
+      c.recordWriteQueueDepth(5);
+      c.recordWriteQueueDepth(1);
+      const diag = c.buildSupervisorDiagnostics({
+        activeActors: 1, totalSpawned: 1, totalTerminated: 0,
+        poolSize: 10, boxesInUse: 2, actors: [],
+      });
+      expect(diag.writeQueueDepth).toBeDefined();
+      expect(diag.writeQueueDepth!.avgDepth).toBeCloseTo(3);
+      expect(diag.writeQueueDepth!.maxDepth).toBe(5);
+      expect(diag.writeQueueDepth!.totalSamples).toBe(3);
+    });
+
+    it("tracks authorization events when authorizationEvents enabled", () => {
+      const c = createDiagnosticsCollector(enabledConfig({ authorizationEvents: true }));
+      c.recordAuthorizationEvent(true);
+      c.recordAuthorizationEvent(true);
+      c.recordAuthorizationEvent(false);
+      const diag = c.buildSupervisorDiagnostics({
+        activeActors: 1, totalSpawned: 1, totalTerminated: 0,
+        poolSize: 10, boxesInUse: 2, actors: [],
+      });
+      expect(diag.authorization).toBeDefined();
+      expect(diag.authorization!.granted).toBe(2);
+      expect(diag.authorization!.denied).toBe(1);
+    });
+
+    it("tracks inbox depth when inboxDepth enabled", () => {
+      const c = createDiagnosticsCollector(enabledConfig({ inboxDepth: true }));
+      c.recordInboxDepth("actor-1", 5);
+      c.recordInboxDepth("actor-2", 10);
+      c.recordInboxDepth("actor-1", 3);
+      const diag = c.buildSupervisorDiagnostics({
+        activeActors: 2, totalSpawned: 2, totalTerminated: 0,
+        poolSize: 10, boxesInUse: 2, actors: [],
+      });
+      expect(diag.inboxDepth).toBeDefined();
+      expect(diag.inboxDepth!.maxDepth).toBe(10);
+      expect(diag.inboxDepth!.avgDepth).toBeCloseTo(6.5);
+      expect(diag.inboxDepth!.perActor).toHaveLength(2);
+    });
+
+    it("tracks ref counts when refCountHistory enabled", () => {
+      const c = createDiagnosticsCollector(enabledConfig({ refCountHistory: true }));
+      c.recordRefCount(0, 3);
+      c.recordRefCount(1, 1);
+      c.recordRefCount(2, 5);
+      const diag = c.buildSupervisorDiagnostics({
+        activeActors: 1, totalSpawned: 1, totalTerminated: 0,
+        poolSize: 10, boxesInUse: 3, actors: [],
+      });
+      expect(diag.refCounts).toBeDefined();
+      expect(diag.refCounts!.avgRefCount).toBeCloseTo(3);
+      expect(diag.refCounts!.maxRefCount).toBe(5);
+      expect(diag.refCounts!.samples).toHaveLength(3);
+    });
+
+    it("tracks process lifetimes when processLifetimes enabled", () => {
+      const c = createDiagnosticsCollector(enabledConfig({ processLifetimes: true }));
+      c.recordProcessLifetime("actor-1", 5000);
+      c.recordProcessLifetime("actor-2", 12000);
+      const diag = c.buildSupervisorDiagnostics({
+        activeActors: 2, totalSpawned: 2, totalTerminated: 0,
+        poolSize: 10, boxesInUse: 2, actors: [],
+      });
+      expect(diag.processLifetimes).toBeDefined();
+      expect(diag.processLifetimes!.avgMs).toBe(8500);
+      expect(diag.processLifetimes!.maxMs).toBe(12000);
+      expect(diag.processLifetimes!.perActor).toHaveLength(2);
     });
 
     it("tracks resource calls when resourceCallLatency enabled", () => {
@@ -133,11 +208,31 @@ describe("diagnostics", () => {
       c.recordActorStart("actor-1");
       c.recordActorHeartbeat("actor-1");
       c.recordActorMessage("actor-1");
-      c.recordLockAcquisition(99);
+      c.recordWriteQueueWait(99);
       c.recordResourceCall(99);
       const d = c.buildActorDiagnostics("actor-1", mockState);
       expect(d.heartbeatCount).toBe(5);
       expect(d.messageCount).toBe(10);
+    });
+
+    it("omits optional metrics when track flags are disabled", () => {
+      const c = createDiagnosticsCollector(enabledConfig({}));
+      c.recordWriteQueueWait(10);
+      c.recordWriteQueueDepth(5);
+      c.recordAuthorizationEvent(true);
+      c.recordInboxDepth("actor-1", 3);
+      c.recordRefCount(0, 2);
+      c.recordProcessLifetime("actor-1", 1000);
+      const diag = c.buildSupervisorDiagnostics({
+        activeActors: 1, totalSpawned: 1, totalTerminated: 0,
+        poolSize: 10, boxesInUse: 2, actors: [],
+      });
+      expect(diag.writeQueueWait).toBeUndefined();
+      expect(diag.writeQueueDepth).toBeUndefined();
+      expect(diag.authorization).toBeUndefined();
+      expect(diag.inboxDepth).toBeUndefined();
+      expect(diag.refCounts).toBeUndefined();
+      expect(diag.processLifetimes).toBeUndefined();
     });
 
     // ── Edge cases ──

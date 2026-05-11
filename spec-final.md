@@ -4,7 +4,9 @@
 
 ## 1. Vision & Overview
 
-`@nilejs/future` is a high-performance, system-level actor and promise primitives for **Bun** inspired by Erlang. It facilitates isolated concurrent execution using a **Two-Tier Communication** model, balancing ease of use with zero-copy data transfer.
+`@nilejs/future` is a high-performance, system-level actor library for **Bun** inspired by Erlang. It facilitates isolated concurrent execution using a **Two-Tier Communication** model: Tier 1 for control signals and small data via `postMessage`, Tier 2 for zero-copy shared memory via `SharedArrayBuffer`.
+
+The design follows Erlang's message-passing model: immutable data, per-actor inboxes, and transparent authorization. Actors never share state. All inter-actor communication goes through the supervisor, which routes messages and manages box lifecycle.
 
 ---
 
@@ -13,40 +15,41 @@
 ### ADR 001: Callback-Based Spawning
 
 * **Decision:** Actors are spawned via serialized callbacks rather than external files.
-* **Why:** Allows the Supervisor to inject "Resource Manager" proxies and context (`ctx`) automatically. It improves Developer Experience (DX) by keeping logic co-located. Enables safe concurrent execution with automatic cleanup.
+* **Why:** Allows the Supervisor to inject Resource Manager proxies and context (`ctx`) automatically. Improves Developer Experience (DX) by keeping logic co-located. Enables safe concurrent execution with automatic cleanup.
 * **Trade-off:** Closures are lost, outer scope is not inherited. All state must be passed explicitly via `msg` or accessed through `ctx.resources`. This isolation prevents memory leaks and ensures actors can be terminated safely.
 * **Benefits:** Any actor can be terminated on demand. Hanging code is automatically killed. One actor's failure cannot corrupt another's state.
 
-### ADR 002: Two-Tier Communication (Hybrid Model)
+### ADR 002: Two-Tier Communication with Immutable Boxes
 
-* **Decision:** Split messaging into Tier 1 (Control/Signals) and Tier 2 (Data/Zero-copy).
-* **Why:** `postMessage` is too slow for large buffers due to serialization tax. SharedArrayBuffer alone is too complex for simple status updates.
-* **Strategy:** Tier 1 uses native messaging; Tier 2 uses atomic-locked shared memory.
-* **Usage Pattern:** Tier 1 is used more frequently for coordination; Tier 2 reserved for bulk data transfer.
+* **Decision:** Split messaging into Tier 1 (Control/Signals) and Tier 2 (Data/Zero-copy). Tier 2 uses immutable SharedArrayBuffer boxes with supervisor-managed state, not CAS atomic locking.
+* **Why:** `postMessage` is too slow for large buffers due to serialization tax. SharedArrayBuffer alone is too complex for simple status updates. Removing CAS simplifies the state machine and eliminates a class of concurrency bugs.
+* **Strategy:** Tier 1 uses native messaging. Tier 2 uses a pre-allocated pool of fixed-size SAB segments. Supervisor tracks box state in plain objects. Messages route via per-actor inbox queues.
+* **Usage Pattern:** Tier 1 for coordination and small payloads. Tier 2 for bulk data transfer with zero-copy reads.
+* **Immutable After Commit:** Data written to a box becomes immutable after `COMMIT`. Multiple readers can read concurrently without synchronization. No reading state. No atomic contention.
 
-### ADR 003: Tier 2 Memory Pool Strategy
+### ADR 003: Queue-Based Box Assignment
 
-* **Decision:** Use a configurable pool of memory boxes with FIFO queuing instead of N+1 dedicated lanes.
-* **Why:** FIFO queues with atomic lock dynamics prevent contention effectively. Pool strategy is simpler and scales better with varying workloads.
+* **Decision:** Use a configurable pool of memory boxes with queue-based assignment instead of CAS lock acquisition.
+* **Why:** FIFO queues with supervisor-side state tracking eliminate atomic contention entirely. No spin-waiting. No CAS retry loops.
 * **Configuration:** `poolSize` (max concurrent boxes) and `boxSize` (size of each box).
-* **Trade-off:** No size-classes (SM/MD/LG); single configurable box size. Simpler but less optimized for varied payload sizes.
+* **Trade-off:** No size-classes (SM/MD/LG); single configurable box size. Simpler but less optimized for varied payload sizes. No CAS means all state transitions are deterministic and observable.
 
-### ADR 004: Opportunistic Lease Cleanup
+### ADR 004: Opportunistic Lease Cleanup on Commit
 
-* **Decision:** Calculate timeout timestamps at acquisition time and store in header. Cleanup happens on any actor-supervisor interaction, not via setTimeout.
-* **Why:** More performant than setTimeout; avoids timer overhead. Cleanup is deterministic and happens when there's natural interaction.
-* **Mechanism:** Store `expiresAt` timestamp. On any `self.send()`, `ctx.deposit()`, `ctx.heartbeat()`, or resource call, check if any leases have expired and clean up.
+* **Decision:** Calculate timeout timestamps at commit time (not lock acquisition) and store in supervisor-side `BoxEntry`. Cleanup happens on any actor-supervisor interaction, not via `setTimeout`.
+* **Why:** More performant than `setTimeout`; avoids timer overhead. Cleanup is deterministic and happens when there is natural interaction. Leasing on commit (not write) gives writers unrestricted time to prepare data while bounding read access.
+* **Mechanism:** Store `expiresAt` in `BoxEntry`. On any `self.send()`, `ctx.write()`, `ctx.release()`, `ctx.heartbeat()`, or resource call, check if any boxes have expired and clean up.
 
 ### ADR 005: Context-Based Formatting & Serialization
 
 * **Decision:** Provide buffer allocation and serialization utilities via `ctx.fmt` namespace.
-* **Why:** Developers shouldn't think about `Uint8Array`, `TextEncoder`, or manual serialization. Keep low-level details abstracted.
-* **Configuration:** Default codec is JSON, but configurable per supervisor.
+* **Why:** Developers should not think about `Uint8Array`, `TextEncoder`, or manual serialization. Keep low-level details abstracted.
+* **Configuration:** Default codec is JSON, configurable per supervisor.
 * **Design:**
   - `ctx.fmt.alloc(size)` - Buffer allocation (replaces `new Uint8Array(length)`)
   - `ctx.fmt.from(data)` - Create buffer from data with auto-encoding
-  - `ctx.fmt.encode(data)` - Auto-detect encoding (string→UTF8, object→JSON, TypedArray→passthrough)
-  - `ctx.fmt.decode(buffer)` - Auto-detect decoding (JSON→object, string→UTF8, else raw)
+  - `ctx.fmt.encode(data)` - Auto-detect encoding (string to UTF8, object to JSON, TypedArray passthrough)
+  - `ctx.fmt.decode(buffer)` - Auto-detect decoding (JSON to object, string to UTF8, else raw)
   - `ctx.fmt.json.encode/decode` - Explicit JSON encoding/decoding
   - `ctx.fmt.string.encode/decode` - Explicit string encoding/decoding
   - `ctx.fmt.cbor.encode/decode` - CBOR encoding/decoding (if available)
@@ -54,26 +57,36 @@
 ### ADR 006: Bun-Only Runtime Support
 
 * **Decision:** Target **Bun exclusively** as the runtime. Drop official Node.js support.
-* **Why:** 
-  - Bun has native TypeScript support without transpilation or loaders. Worker threads in Bun can directly resolve `.ts` imports, which is essential for our callback serialization model.
+* **Why:**
+  - Bun has native TypeScript support without transpilation or loaders. Worker threads in Bun can directly resolve `.ts` imports, which is essential for the callback serialization model.
   - Node.js worker threads require `tsx`, `ts-node`, or pre-compilation to resolve TypeScript worker entry points. This adds friction and breaks the zero-config developer experience.
   - Bun's `SharedArrayBuffer` + `Atomics` implementation is fully compatible with the spec.
   - Focusing on one runtime reduces testing surface and lets us leverage Bun-specific optimizations.
-* **Trade-off:** Users on Node.js cannot use `@nilejs/future` without Bun. This excludes a large segment of the JS ecosystem.
+* **Trade-off:** Users on Node.js cannot use `@nilejs/future` without Bun.
 * **Mitigation:** Document the Bun requirement clearly. If demand is high, Node.js support can be added later via a `tsx` loader or pre-compiled worker bootstrap.
-* **Status:** Bun-only for now. Node.js support is a **planned future enhancement** (see Milestones).
+* **Status:** Bun-only for now. Node.js support is a **planned future enhancement**.
 
-* **Decision:** Provide buffer allocation and serialization utilities via `ctx.fmt` namespace.
-* **Why:** Developers shouldn't think about `Uint8Array`, `TextEncoder`, or manual serialization. Keep low-level details abstracted.
-* **Configuration:** Default codec is JSON, but configurable per supervisor.
-* **Design:**
-  - `ctx.fmt.alloc(size)` - Buffer allocation (replaces `new Uint8Array(length)`)
-  - `ctx.fmt.from(data)` - Create buffer from data with auto-encoding
-  - `ctx.fmt.encode(data)` - Auto-detect encoding (string→UTF8, object→JSON, TypedArray→passthrough)
-  - `ctx.fmt.decode(buffer)` - Auto-detect decoding (JSON→object, string→UTF8, else raw)
-  - `ctx.fmt.json.encode/decode` - Explicit JSON encoding/decoding
-  - `ctx.fmt.string.encode/decode` - Explicit string encoding/decoding
-  - `ctx.fmt.cbor.encode/decode` - CBOR encoding/decoding (if available)
+### ADR 007: Erlang-Style Message Model
+
+* **Decision:** Messages are immutable, typed packets routed through per-actor inboxes. The `Message` type carries a matching key, optional format hint, optional SAB handle, and auto-injected sender identity.
+* **Why:** Erlang's model of immutable data with mailbox routing eliminates shared-state bugs. No actor can mutate another actor's data. `from` is always trustworthy because the supervisor injects it.
+* **Strategy:**
+  - `msg` field serves as the matching key for `matchAll` dispatch (equivalent to Erlang message tags).
+  - `handle` is a supervisor-side `Lock` opaque reference to SAB data, never raw memory addresses.
+  - `from` is auto-injected by supervisor at send time, never settable by the sender.
+  - Boxes with handles are immutable after commit, mirroring Erlang's "copy on send, read-only on receive."
+* **Trade-off:** Passing data through supervisor-mediated inboxes adds one level of indirection compared to direct SAB access. This indirection is the foundation of authorization and lifecycle management.
+
+### ADR 008: Authorization Model
+
+* **Decision:** Implement `ShareConfig` with four levels: `"owner"`, `"group"`, `"linked"`, and explicit `ActorId[]`.
+* **Why:** Not all shared data should be visible to all actors. Authorization at the write level prevents data leaks. The model mirrors Unix file permissions in spirit (owner/group/world) adapted to actor topology.
+* **Levels:**
+  - `"owner"` (default): Only the writer actor can read. Subscribers on the main thread can always read.
+  - `"group"`: All actors in the same supervision group can read.
+  - `"linked"`: Actors linked to the writer can read (bi-directional and uni-directional links).
+  - Explicit list: Only specified actor IDs can read.
+* **Enforcement:** Supervisor checks `readers` set in `BoxEntry` on every `INBOX` delivery. Unauthorized read attempts are silently dropped.
 
 ---
 
@@ -81,35 +94,76 @@
 
 ### Memory Layout (The Shared Bus)
 
-The `SharedArrayBuffer` is divided into a **Control Header** and a **Data Region**.
+The `SharedArrayBuffer` is divided into **Data Boxes** only. All state tracking moves to supervisor-side plain objects.
 
 | Section | Type | Description |
 | --- | --- | --- |
-| **State Board** | `Int32Array` | Indices tracking Box state: `0` (Clean), `1` (Locked/Writing), `2` (Ready), `3` (Reading). |
-| **Lease Tracker** | `BigInt64Array` | Timestamps (`expiresAt`) of when each lock expires. `0` = no lease. |
 | **Data Boxes** | `Uint8Array` | Fixed-size memory segments (configurable `boxSize`). |
+
+No State Board. No Lease Tracker. No CAS operations on the SAB. The SAB is raw byte storage only.
+
+### Supervisor-Side State Tracking
+
+The supervisor maintains a `BoxEntry[]` array parallel to the data boxes:
+
+```typescript
+type BoxEntry = {
+  state: "FREE" | "WRITING" | "READY";
+  from: ActorId;
+  msg: string;
+  type: FmtType;
+  share: ShareConfig;
+  refCount: number;
+  expiresAt: number;
+  writer: ActorId | null;
+  readers: Set<ActorId>;
+};
+```
+
+Box identity is an index into this array, wrapped in an opaque `Lock` type:
+
+```typescript
+type Lock = { boxIndex: number; epoch: number };
+```
+
+The `epoch` prevents use-after-free: if a box is recycled and reassigned, old handles with a stale epoch are rejected.
 
 ### The Two-Tier System
 
-1. **Tier 1 (Control):** A PubSub implementation over `worker.postMessage`. Used for `self.send()`, `ctx.resources` (Resource Manager) intents, and heartbeats.
-2. **Tier 2 (Data):** Atomic-locked memory access. Used for `ctx.deposit()`. Uses `Atomics.compareExchange` for non-blocking lock acquisition.
+1. **Tier 1 (Control):** `worker.postMessage` for `self.send()`, `ctx.resources` intents, heartbeats, inbox delivery, and protocol messages (`WRITE_REQUEST`, `COMMIT`, `RELEASE`, etc.).
+2. **Tier 2 (Data):** Direct `SharedArrayBuffer` read/write. Writers copy data into a locked box. Readers decode from immutable READY boxes. No atomic operations on data.
 
 ### State Machine
 
-The State Board implements a 4-state machine with reference counting for concurrent reads:
+Three states. No CAS. Supervisor tracks state in plain `BoxEntry` objects.
 
 ```
-CLEAN(0) --acquireLock()--> LOCKED(1) --ctx.done()--> READY(2) --actor.read()/ctx.read()--> READING(3) --actor.done()/ctx.done()--> CLEAN(0)
-                                                              ^                                      |
-                                                              └──────── concurrent readers ──────────┘
+FREE -> WRITING -> READY -> FREE
 ```
 
-- **CLEAN(0):** Box available for acquisition. `tryAcquireBox()` uses `CAS(CLEAN→LOCKED)`.
-- **LOCKED(1):** Writer owns the box. Writer writes directly to SAB, then calls `ctx.done()`.
-- **READY(2):** Data ready. Subscribers notified via `DEPOSIT_READY`. Transitions to READING on first read.
-- **READING(3):** One or more active readers. Reference count tracked by supervisor. Last reader triggers `READING→CLEAN`.
+- **FREE:** Box is available for assignment. No writer. No data.
+- **WRITING:** One writer assigned. Writer copies data into the SAB segment. Mutable.
+- **READY:** Data committed. Immutable. Ref count tracks active readers. No READING state because immutable data needs no synchronization.
+- **Transition to FREE:** When ref count reaches 0 (all readers released), box returns to FREE.
 
-All state transitions are serialized on the main thread. Workers request reads via `READ_START` / `READ_GRANTED` messages.
+All state transitions are deterministic and managed by the supervisor in response to worker protocol messages.
+
+### Per-Actor Inbox
+
+The supervisor maintains a queue of incoming messages for each actor. Inbox entries hold Lock references, not data copies:
+
+```typescript
+type InboxEntry = {
+  handle: Lock;
+  from: ActorId;
+  msg: string;
+  type: FmtType;
+};
+
+const inboxes: Map<ActorId, InboxEntry[]>;
+```
+
+When an actor completes its current message handler, the supervisor delivers the next message from its inbox by posting an `INBOX` protocol message.
 
 ---
 
@@ -146,22 +200,22 @@ const supervisor = createSupervisor({
     poolSize: 10,      // Max concurrent boxes in the pool
     boxSize: '1mb'     // Size of each box (same for all)
   },
-  
+
   // Timeout Configuration
   timeouts: {
-    // Global lease timeout (applies to all actors unless overridden)
+    // Lease timeout for READY boxes (applies to all actors unless overridden)
     defaultLeaseMs: 5000,
-    
+
     // Per-actor timeout overrides (optional)
     actorTimeouts: {
       'heavy-compute': 10000,
       'quick-task': 2000
     }
   },
-  
+
   // Supervision Strategy (default: one-for-one)
   strategy: 'one-for-one',
-  
+
   // Retry Configuration
   retry: {
     max: 3,
@@ -173,6 +227,20 @@ const supervisor = createSupervisor({
 ---
 
 ## 5. Actor Context Interface (The DSL)
+
+### Message Shape
+
+```typescript
+type FmtType = "json" | "string" | "binary" | "cbor";
+
+type Message = {
+  msg: string;           // Matching key for matchAll
+  type?: FmtType;        // Required for Tier 2. Absent for Tier 1 (json assumed)
+  data?: Uint8Array;     // Raw bytes. Always raw. No auto-decode.
+  handle?: Lock;         // Tier 2 SAB reference. Absent for Tier 1
+  from: ActorId;         // Auto-injected by supervisor. Sender never sets this.
+};
+```
 
 ### Actor Callback Interface
 
@@ -198,19 +266,21 @@ actor.spawn({ timeout: 5000, dataId: 'abc123' });
 
 ```typescript
 const actor = supervisor.spawn(async (self, msg, ctx) => {
-  // Tier 1: Signal/Status update
-  self.send({ status: 'active' });
+  // Tier 1: Signal/Status update (small data, JSON)
+  self.send("progress", { percent: 0.5 });
 
-  // Tier 2: Acquire lock, deposit data, mark done
-  const lock = await ctx.acquireLock();
-  ctx.deposit(lock, uint8Data);
-  ctx.done(lock);
+  // Tier 2: Zero-copy SAB write. One async call.
+  const handle = await ctx.write({
+    msg: "result",
+    type: "json",
+    data: ctx.fmt.encode({ large: "payload" }),
+    share: "group",
+  });
 
-  // Tier 2: Read from another actor's deposit (worker context)
-  const readLock = msg.lock;
-  const buffer = await ctx.read(readLock);
-  const data = ctx.fmt.decode(buffer);
-  ctx.done(readLock);
+  // Tier 2: Read SAB data from an incoming message
+  const input = ctx.read(msg).json();
+  const result = heavyComputation(input);
+  ctx.release(msg.handle);
 
   // Explicit Heartbeat (resets lease during CPU-intensive loops)
   ctx.heartbeat();
@@ -227,8 +297,15 @@ const actor = supervisor.spawn(async (self, msg, ctx) => {
 });
 
 // Main Program: Subscribe to actor messages
-actor.subscribe(msg => {
-  // Handles Tier 1 signals and Tier 2 'Done' notifications
+actor.subscribe((msg) => {
+  // Handles Tier 1 signals and Tier 2 inbox deliveries
+  matchAll(msg, {
+    result: (m) => {
+      const data = actor.read(m).json();
+      actor.release(m.handle);
+    },
+    _: () => {},
+  });
 });
 ```
 
@@ -248,10 +325,11 @@ group.terminateAll();
 ```
 
 Termination guarantees:
-- Buffer state reset to Clean (returned to pool)
-- Resource cleanup hooks called
-- Linked actors receive termination signal
-- Actor reference marked as dead
+- In-flight write requests are cancelled.
+- Locked boxes are force-released to FREE.
+- Resource cleanup hooks are called.
+- Linked actors receive termination signal.
+- Actor reference is marked as dead.
 
 ### Termination vs AbortController
 
@@ -273,33 +351,73 @@ Most libraries in TypeScript and JavaScript cannot do this. @nilejs/future and E
 ### Context API
 
 | Method | Tier | Description |
-| --- | --- | --- |
-| `self.send(msg)` | 1 | Send signal/status to subscribers. Triggers implicit heartbeat. |
-| `ctx.acquireLock()` | 2 | Acquire a box from the pool. Returns lock with `byteOffset` and `length`. |
-| `ctx.deposit(lock, data)` | 2 | Write data to the box. Triggers implicit heartbeat. |
-| `ctx.read(lock)` | 2 | Read data from a READY box (async in worker, sync on main thread). |
-| `ctx.done(lock)` | 2 | Finalize write (READY→CLEAN) or release read lock (READING→CLEAN). |
+|---|---|---|
+| `self.send(msg, data)` | 1 | Send signal/status to subscribers. JSON default. Auto-injects `from`. |
+| `ctx.write({ msg, type, data, share })` | 2 | Write data to SAB. Zero-copy. Returns `Lock`. Immutable after write. |
+| `ctx.read(m)` | 2 | Read SAB data from message. Returns chainable decoder. |
+| `ctx.release(handle)` | 2 | Decrement ref count. If 0 then FREE. |
 | `ctx.heartbeat()` | 1 | Explicitly reset lease timer during CPU-intensive loops. |
 | `ctx.resources.*` | 1 | Access resources via Proxy. Calls go through intent relay. |
 | `ctx.link(actor)` | 1 | Create bi-directional link. If either dies, both die. |
 | `ctx.monitor(actor)` | 1 | Create uni-directional monitor. Receive notification when actor dies. |
+| `ctx.spawn(callback)` | 1 | Spawn a child actor. |
 | `ctx.terminate()` | 1 | Terminate the actor gracefully. |
 | `ctx.isCancelled` | 1 | Check if actor has been terminated. |
-| `ctx.fmt.alloc(size)` | N/A | Allocate a buffer (replaces `new Uint8Array`). |
-| `ctx.fmt.from(data)` | N/A | Create buffer from data with auto-encoding. |
-| `ctx.fmt.encode(data)` | N/A | Encode data (auto-detect or explicit: json, string, cbor). |
-| `ctx.fmt.decode(buffer)` | N/A | Decode buffer to typed data. |
+| `ctx.fmt.*` | N/A | Buffer allocation and serialization utilities. |
+
+### ActorRef API
+
+| Method | Description |
+|---|---|
+| `actor.id` | Unique actor identifier |
+| `actor.spawn(msg)` | Send initial message to actor |
+| `actor.subscribe(fn)` | Subscribe to actor messages |
+| `actor.terminate()` | Terminate actor immediately |
+| `actor.read(m)` | Read SAB data from message. Returns chainable decoder. |
+| `actor.release(handle)` | Decrement ref count. If 0 then FREE. |
+| `actor.getDiagnostics()` | Get actor diagnostics |
+| `actor.link(other)` | Bi-directional link |
+| `actor.monitor(other)` | Uni-directional monitor |
+
+### Chainable Reader API
+
+`ctx.read(m)` and `actor.read(m)` return a chainable decoder object:
+
+```typescript
+const reader = ctx.read(m);
+reader.json();     // Decode as JSON (default: m.type === "json")
+reader.string();   // Decode as UTF-8 string
+reader.binary();   // Return raw Uint8Array
+reader.cbor();     // Decode as CBOR (if available)
+reader.raw();      // Return Uint8Array from SAB slice (main thread only)
+```
+
+The `m.type` field hints the default decode method. `ctx.read(m).json()` is equivalent to `ctx.read(m).decode('json')`.
+
+If `m.handle` is absent (Tier 1 message), `ctx.read(m)` returns `null` for all decoders.
 
 ---
 
-## 6. Lock Acquisition (FIFO)
+## 6. Write Queue (FIFO Box Assignment)
 
-If an actor requests a lock and no boxes are available:
+When an actor calls `ctx.write()` and no boxes are FREE:
 
-1. The request is pushed to an internal `Queue<Resolver>` in the Main Process.
-2. When a box is marked `0` (Clean) by a retriever, the next resolver is triggered.
-3. The actor receives the `lock` object containing the `byteOffset` and `length`.
-4. Uses `Atomics.compareExchange` for non-blocking lock acquisition.
+1. The request is pushed to an internal `Queue<WriteRequest>` in the supervisor.
+2. When a box transitions to FREE (via `RELEASE` or lease expiry), the supervisor assigns it to the next queued writer.
+3. The writer receives a `WRITE_GRANTED` protocol message with the `Lock`.
+4. The writer copies data into the SAB segment and sends `COMMIT { lock }`.
+
+```typescript
+type WriteRequest = {
+  actorId: ActorId;
+  msg: string;
+  type: FmtType;
+  data: Uint8Array;
+  share: ShareConfig;
+  resolve: (lock: Lock) => void;
+  reject: (error: Error) => void;
+};
+```
 
 ---
 
@@ -308,7 +426,7 @@ If an actor requests a lock and no boxes are available:
 Inside the worker callback, `ctx.resources` is a **Proxy**.
 
 * **Call:** `ctx.resources.db.query({ sql: 'SELECT 1' })`
-* **Action:** Proxy intercepts the call, packages it as an "Intent Packet," and sends it via Tier 1 to the Supervisor.
+* **Action:** Proxy intercepts the call, packages it as an Intent Packet, and sends it via Tier 1 to the Supervisor.
 * **Return:** Supervisor executes the real logic and sends the result back to the worker.
 * **Release:** Each resource can define a `release()` method called during Supervisor cleanup.
 * **Schema:** Each method must specify a Zod input and output schema for type safety and validation.
@@ -327,8 +445,8 @@ Inside the worker callback, `ctx.resources` is a **Proxy**.
 
 ### Constraints
 
-* **Serialization:** Arguments and return values must be Cloneable (JSON-compatible or Uint8Array).
-* **Large Data:** For large returns, return a Tier 2 address instead of actual data.
+* **Serialization:** Arguments and return values must be Cloneable (JSON-compatible or `Uint8Array`).
+* **Large Data:** For large returns, return a Tier 2 lock address instead of actual data.
 * **Scoping:** Supervisor can optionally filter resources per actor.
 * **Schema Required:** All resource methods must declare Zod schemas for inputs and outputs.
 
@@ -336,25 +454,27 @@ Inside the worker callback, `ctx.resources` is a **Proxy**.
 
 ## 8. Heartbeat & Lease System
 
-The Heartbeat is the "Dead Man's Switch" that prevents an actor from holding a memory box indefinitely.
+The Heartbeat is the Dead Man's Switch that prevents data from being held indefinitely in READY boxes.
 
-### ADR 005: Explicit & Implicit Heartbeats
+### Lease Mechanism
 
-* **Decision:** Implement a `Lease` system where a lock expires after `defaultLeaseMs` unless a heartbeat is received.
-* **Mechanism:**
-  1. **Implicit:** Every Tier 1 `self.send()` or Tier 2 `ctx.deposit()` automatically updates the `Lease Tracker` in the SAB Header.
-  2. **Explicit:** `ctx.heartbeat()` allows manual timestamp reset during high-CPU loops that don't perform I/O.
-  3. **Opportunistic Cleanup:** On ANY actor-supervisor interaction, check for expired leases and recycle boxes.
+* **Decision:** Lease timestamps are computed at COMMIT time and stored in the supervisor-side `BoxEntry.expiresAt`.
+* **Reset:** When a new reader acquires a handle to a READY box, `expiresAt` is extended (reset timer).
+* **Check:** On any actor-supervisor interaction (`self.send`, `ctx.write`, `ctx.release`, `ctx.heartbeat`, resource call), check all `BoxEntry` entries for expired leases.
 
-### Supervisor Action
+### Lease Expiry
 
-On any interaction (self.send, ctx.deposit, ctx.heartbeat, resource call):
-1. Check `Lease Tracker` for expired leases.
-2. If `Date.now() > expiresAt`:
-   - **Panic:** Terminate the actor thread.
-   - **Recycle:** Set Box state to `0` (Clean) and return to pool.
+If `Date.now() > expiresAt`:
+1. Force-release all reader refs on that box.
+2. Set box state to FREE.
+3. If a writer is still holding the box in WRITING state, terminate the writer actor.
+4. If any queued write requests exist, assign the freshly freed box to the next in queue.
 
-### Lease Timeout Configuration
+### Explicit Heartbeat
+
+`ctx.heartbeat()` resets the lease timer for any boxes the calling actor holds:
+- As writer in WRITING state: extends write timeout.
+- As reader with active handle: extends read lease.
 
 ```typescript
 const supervisor = createSupervisor({
@@ -369,11 +489,11 @@ const supervisor = createSupervisor({
 
 ---
 
-## 9. Supervision Strategies (The "Restart" Logic)
+## 9. Supervision Strategies (The Restart Logic)
 
-When defining a Supervisor, specify a `strategy` that determines the fate of "siblings" when one actor fails.
+When defining a Supervisor, specify a `strategy` that determines the fate of siblings when one actor fails.
 
-### ADR 006: Supervision Strategies
+Three supervision strategies are supported:
 
 * **One-For-One (Default):** If an actor dies, only that actor is restarted. Good for independent tasks.
 * **One-For-All:** If one actor dies, kill and restart **all** actors in that group. Use when actors are tightly coupled.
@@ -395,12 +515,12 @@ const billingGroup = supervisor.createGroup({
 
 ### Linking (Bi-directional)
 
-Linking creates a "suicide pact." If Actor A links to Actor B, and either dies, the other is automatically killed.
+Linking creates a suicide pact. If Actor A links to Actor B, and either dies, the other is automatically killed.
 
 ```typescript
 // Inside Actor A
 const workerActor = await ctx.spawn(workerCallback);
-ctx.link(workerActor); 
+ctx.link(workerActor);
 
 // If Actor A crashes, Supervisor automatically kills 'workerActor'
 ```
@@ -412,11 +532,10 @@ Monitoring sends a notification without killing the monitor. Actor A monitors Ac
 ```typescript
 ctx.monitor(actorB);
 
-self.subscribe((msg) => {
-  match(msg, {
-    ActorDown: (info) => println(`Actor ${info.id} died of ${info.reason}`),
-    _: () => {}
-  });
+// Receive monitor notification via message handler
+matchAll(msg, {
+  DOWN: (info) => console.log(`Actor ${info.id} died: ${info.reason}`),
+  _: () => {}
 });
 ```
 
@@ -430,28 +549,60 @@ To keep link propagation fast, the Supervisor tracks links in a **Dependency Mat
 
 ### Health Metrics
 
-The Supervisor manages three distinct "Health" metrics for every actor:
+The Supervisor manages three distinct health metrics for every actor:
 
-1. **The Lease (Memory):** Is the actor holding a Tier 2 box too long? (Lease expiry check on interaction).
-2. **The Exit (Lifecycle):** Did the process/thread finish with a non-zero exit code?
-3. **The Link (Topology):** Does this death require me to kill others?
+1. **The Lease (Memory):** Is a READY box held too long? (Lease expiry check on interaction).
+2. **The Exit (Lifecycle):** Did the worker thread finish with a non-zero exit code?
+3. **The Link (Topology):** Does this death require killing other actors?
+
+### Box Metadata Table
+
+The supervisor maintains a `BoxEntry[]` array as the single source of truth for box state:
+
+| Field | Type | Description |
+|---|---|---|
+| `state` | `"FREE" \| "WRITING" \| "READY"` | Current box state |
+| `from` | `ActorId` | Writer actor ID |
+| `msg` | `string` | Message matching key |
+| `type` | `FmtType` | Data format hint |
+| `share` | `ShareConfig` | Authorization level |
+| `refCount` | `number` | Active reader count |
+| `expiresAt` | `number` | Lease expiry timestamp |
+| `writer` | `ActorId \| null` | Writer actor (null when FREE) |
+| `readers` | `Set<ActorId>` | Set of authorized reader IDs |
+
+### Inbox Data Structure
+
+```typescript
+type InboxEntry = {
+  handle: Lock;
+  from: ActorId;
+  msg: string;
+  type: FmtType;
+};
+
+const inboxes: Map<ActorId, InboxEntry[]>;
+```
 
 ---
 
 ## 12. Error Handling
 
-* Use `slang-ts` `Result` types for all async operations like `acquireLock`.
-* Resource Manager errors are serialized, sent back, and re-thrown (or returned as `Err`) in the actor.
+* Use `slang-ts` `Result` types for all async operations like `ctx.write`.
+* Resource Manager errors are serialized, sent back, and returned as `Err` in the actor.
 * Supervision strategies handle actor crashes based on configuration.
+* Authorization failures at read time are silent: the unauthorized reader simply does not receive the message.
+* Lease expiry kills the holding actor if in WRITING state. Readers are silently released, box returns to FREE.
 
 ---
 
 ## 13. Delivery Milestones
 
-1. **Phase 1:** Tier 1 PubSub and Callback Serialization (Bun).
-2. **Phase 2:** SAB implementation with Atomic locking, FIFO queue, and pool strategy.
-3. **Phase 3:** Resource Manager Proxy implementation with release methods and Zod schemas.
-4. **Phase 4:** Opportunistic lease cleanup, backpressure logic, and diagnostics.
+1. **Phase 1:** Tier 1 PubSub with `self.send()` and callback serialization (Bun).
+2. **Phase 2:** Tier 2 SAB pool with `ctx.write()`, immutable boxes, `COMMIT`/`RELEASE` protocol.
+3. **Phase 3:** Per-actor inbox routing, `INBOX` delivery, and `ctx.read()` chainable decoder.
+4. **Phase 4:** Authorization model (`ShareConfig`: owner/group/linked/explicit).
+5. **Phase 5:** Resource Manager Proxy, opportunistic lease cleanup, and embedded diagnostics.
 
 ---
 
@@ -494,11 +645,20 @@ describe('featureName', () => {
 
 ### Testing Approach
 
-* **Unit Tests:** Individual functions/utilities (e.g., `encode/decode`, lock acquisition)
+* **Unit Tests:** Individual functions and utilities (e.g., `encode`/`decode`, queue management)
 * **Integration Tests:** Actor interactions, message passing, Tier 1/Tier 2 coordination
 * **Property-Based Tests:** Invariant validation across random inputs
-* **Stress Tests:** Memory pool, lock contention, high concurrency scenarios
-* **Chaos Tests:** Simulated crashes, timeouts, network failures
+* **Stress Tests:** Memory pool, write contention, high concurrency scenarios
+* **Chaos Tests:** Simulated crashes, timeouts, authorization failures
+
+### Key Invariants
+
+- A box in WRITING state has exactly one writer.
+- A box in READY state has immutable data.
+- `refCount` decrements to 0 before FREE transition.
+- `from` is always the supervisor-injected sender identity.
+- No message reaches an unauthorized reader.
+- `epoch` on Lock prevents use-after-free on recycled boxes.
 
 ---
 
@@ -518,14 +678,17 @@ const supervisor = createSupervisor({
 
     // Track specific metrics
     track: {
-      actorLifetimes: true,           // Track creation→termination duration
+      actorLifetimes: true,           // Track creation to termination duration
       startTimes: true,               // Actor and system initialization times
       processLifetimes: true,         // Worker thread lifetimes
-      lockAcquisitionTimes: true,     // Time spent waiting for locks
+      writeQueueDepth: true,          // Pending write request queue depth
       messageLatency: true,           // Tier 1/Tier 2 message round-trip
-      bufferUtilization: true,        // Pool usage percentages
+      bufferUtilization: true,        // Pool usage percentages (FREE/WRITING/READY)
       heartbeatIntervals: true,       // Time between heartbeats
       resourceCallLatency: true,      // Proxied method call durations
+      authorizationEvents: true,      // Authorized vs denied read attempts
+      inboxDepth: true,               // Per-actor inbox queue depth
+      refCountHistory: true,          // Box ref count over time
     }
   }
 });
@@ -538,18 +701,21 @@ const supervisor = createSupervisor({
 | `actorLifetimes` | Creation time, last heartbeat, termination reason |
 | `startTimes` | Actor spawn time, supervisor init time |
 | `processLifetimes` | Worker thread uptime, restart count |
-| `lockAcquisitionTimes` | Average/max wait times, queue depths |
+| `writeQueueDepth` | Average/max queue depths, wait times |
 | `messageLatency` | Messages/sec by type and tier |
-| `bufferUtilization` | Pool allocation/free rates, fragmentation |
+| `bufferUtilization` | Pool state distribution (FREE/WRITING/READY), utilization |
 | `heartbeatIntervals` | Intervals, missed heartbeats, timeout events |
 | `resourceCallLatency` | Duration of proxied method calls |
+| `authorizationEvents` | Count of reads granted vs denied |
+| `inboxDepth` | Per-actor inbox queue depth over time |
+| `refCountHistory` | Box reference count snapshots |
 
 ### Implementation Notes
 
-* Uses `performance.now()` for high-resolution timing
-* Atomic counters for low-overhead increment operations
-* Zero-cost when disabled (conditional compilation where possible)
-* Data accessible via `supervisor.getDiagnostics()` or periodic export
+* Uses `performance.now()` for high-resolution timing.
+* Atomic counters for low-overhead increment operations.
+* Zero-cost when disabled (conditional compilation where possible).
+* Data accessible via `supervisor.getDiagnostics()` or periodic export.
 
 ### Usage
 
@@ -558,19 +724,19 @@ const supervisor = createSupervisor({
 setInterval(() => {
   const stats = supervisor.getDiagnostics();
   matchAll(stats, {
-    Ok: (s) => println('System health:', {
-      avgLockWait: s.lockAcquisition.mean,
+    Ok: (s) => console.log('System health:', {
+      writeQueueDepth: s.writeQueueDepth,
       actorCount: s.activeActors,
-      poolUsage: s.memoryPool.utilization
+      poolDistribution: s.bufferUtilization
     }),
-    Err: (e) => println('Diagnostics unavailable:', e.error),
+    Err: (e) => console.log('Diagnostics unavailable:', e.error),
     _: () => {}
   });
 }, 5000);
 
 // Per-actor diagnostics
 actor.getDiagnostics().andThen((d) => {
-  println(`Actor ${actor.id}: lifetime=${d.lifetimeMs}ms, heartbeats=${d.heartbeatCount}`);
+  console.log(`Actor ${actor.id}: lifetime=${d.lifetimeMs}ms, heartbeats=${d.heartbeatCount}`);
   return Ok(d);
 });
 ```
@@ -582,42 +748,42 @@ actor.getDiagnostics().andThen((d) => {
 All code uses `slang-ts` patterns instead of imperative control flow:
 
 ```typescript
-import { 
-  atom, 
-  Err, 
-  match, 
-  matchAll, 
-  Ok, 
-  option, 
-  panic, 
-  pipe, 
-  safeTry, 
-  type Option, 
-  type Result 
+import {
+  atom,
+  Err,
+  match,
+  matchAll,
+  Ok,
+  option,
+  panic,
+  pipe,
+  safeTry,
+  type Option,
+  type Result
 } from "slang-ts";
 
 // match - for Result/Option types
 match(someResult, {
-  Ok: (v) => println("Success:", v.value),
-  Err: (e) => println("Failed:", e.error),
+  Ok: (v) => console.log("Success:", v.value),
+  Err: (e) => console.log("Failed:", e.error),
 });
 
 // matchAll - for tagged unions and arbitrary values
 matchAll(msg, {
-  PROGRESS: (m) => println(`Progress: ${m.value * 100}%`),
-  DEPOSIT_READY: (m) => {
-    const data = actor.read(m.address);
-    println("Data received");
+  progress: (m) => console.log(`Progress: ${m.data.percent * 100}%`),
+  result: (m) => {
+    const data = ctx.read(m).json();
+    console.log("Data received from:", m.from);
   },
-  _: () => println("Unknown message"),
+  _: () => console.log("Unknown message"),
 });
 
 // matchAll with atoms
 const status = atom("ready");
 matchAll(status, {
-  ready: (v) => println("Ready!", v),
-  pending: () => println("Still pending..."),
-  _: () => println("Unknown status"),
+  ready: (v) => console.log("Ready!", v),
+  pending: () => console.log("Still pending..."),
+  _: () => console.log("Unknown status"),
 });
 
 // Result/Option creation
@@ -643,8 +809,8 @@ const pipeline = await pipe(
   (r) => r.isOk ? Ok(validate(r.value)) : r,
 ).run();
 match(pipeline, {
-  Ok: (v) => println("Pipeline result:", v.value),
-  Err: (e) => println("Pipeline failed:", e.error),
+  Ok: (v) => console.log("Pipeline result:", v.value),
+  Err: (e) => console.log("Pipeline failed:", e.error),
 });
 
 // andThen - chainable transformations
@@ -652,7 +818,7 @@ const chained = Ok(10)
   .andThen((x) => x * 2)
   .andThen((x) => x + 5)
   .andThen((x) => ({ value: x }));
-println("Chained result:", chained.value); // 25
+console.log("Chained result:", chained.value); // 25
 ```
 
 ---
@@ -700,46 +866,41 @@ const buffer = ctx.fmt.from(existingUint8Array);   // Pass-through (zero-copy)
 
 ```typescript
 // Auto-detect encoding
-ctx.fmt.encode(data)          // string→UTF8, object→JSON, TypedArray→passthrough
-ctx.fmt.decode(buffer)        // Try JSON→object, then string, else raw buffer
+ctx.fmt.encode(data)          // string to UTF8, object to JSON, TypedArray passthrough
+ctx.fmt.decode(buffer)        // Try JSON to object, then string, else raw buffer
 
 // Explicit JSON encoding/decoding
-ctx.fmt.json.encode(obj)      // → Uint8Array
-ctx.fmt.json.decode(buf)      // → parsed object
+ctx.fmt.json.encode(obj)      // Uint8Array
+ctx.fmt.json.decode(buf)      // parsed object
 
 // Explicit string encoding/decoding
-ctx.fmt.string.encode(str)    // → UTF-8 Uint8Array
-ctx.fmt.string.decode(buf)    // → string
+ctx.fmt.string.encode(str)    // UTF-8 Uint8Array
+ctx.fmt.string.decode(buf)    // string
 
 // CBOR encoding/decoding (if available)
-ctx.fmt.cbor.encode(data)     // → Uint8Array
-ctx.fmt.cbor.decode(buf)     // → parsed object
+ctx.fmt.cbor.encode(data)     // Uint8Array
+ctx.fmt.cbor.decode(buf)      // parsed object
 ```
 
-### Usage Examples
+### Usage with ctx.write / ctx.read
 
 ```typescript
 // Writing structured data to Tier 2
-const lock = await ctx.acquireLock();
-const data = { transactions: [...], metadata: {...} };
-ctx.deposit(lock, ctx.fmt.encode(data));  // Auto JSON encoding
-ctx.done(lock);
+const handle = await ctx.write({
+  msg: "result",
+  type: "json",
+  data: ctx.fmt.encode({ transactions: [...], metadata: {...} }),
+  share: "group",
+});
 
 // Reading structured data from Tier 2
-const lock = msg.lock;                    // Lock passed via Tier 1
-const buffer = await ctx.read(lock);      // Async in worker
-const data = ctx.fmt.decode(buffer);      // Auto JSON decoding
-ctx.done(lock);                           // Release read lock
+const data = ctx.read(m).json();       // Auto JSON decoding via m.type hint
+const text = ctx.read(m).string();     // Explicit string decoding
+const raw = ctx.read(m).binary();      // Raw Uint8Array
 
 // Working with strings
-const text = ctx.fmt.encode("hello world");  // UTF-8 bytes
-const decoded = ctx.fmt.decode(text);        // Back to string
-
-// Manual buffer work (no more new Uint8Array!)
-const results = ctx.fmt.alloc(100);
-for (let i = 0; i < results.length; i++) {
-  results[i] = i % 2;
-}
+const buffer = ctx.fmt.encode("hello world");  // UTF-8 bytes
+const decoded = ctx.fmt.decode(buffer);        // Back to string
 ```
 
 ### Typed Variants for Common Types
@@ -765,7 +926,7 @@ ctx.fmt.alloc.f64(length)   // Float64Array
 
 ```typescript
 import { createSupervisor } from "@nilejs/future";
-import { Ok, match } from "slang-ts";
+import { Ok, matchAll } from "slang-ts";
 
 const supervisor = createSupervisor({
   resources: {
@@ -778,6 +939,7 @@ const supervisor = createSupervisor({
       release: async () => /* cleanup */
     }
   },
+  memory: { poolSize: 8, boxSize: '2mb' },
   timeouts: { defaultLeaseMs: 10000 }
 });
 
@@ -793,22 +955,25 @@ const reconciler = supervisor.spawn(async (self, msg, ctx) => {
     if (i % 100 === 0) ctx.heartbeat();
 
     // Tier 1 progress update
-    self.send({ type: 'PROGRESS', value: i / transactions.length });
+    self.send("progress", { percent: i / transactions.length });
   }
 
-  // Tier 2: Deposit the result
-  const lock = await ctx.acquireLock();
-  ctx.deposit(lock, results);
-  ctx.done(lock);
+  // Tier 2: Write the result as immutable box
+  const handle = await ctx.write({
+    msg: "reconciled",
+    type: "binary",
+    data: results,
+    share: "owner",
+  });
 });
 
 reconciler.subscribe((msg) => {
   matchAll(msg, {
-    PROGRESS: (m) => println(`Progress: ${m.value * 100}%`),
-    DEPOSIT_READY: (m) => {
-      const data = reconciler.read(m.address);
-      println("Batch reconciled.");
-      reconciler.done(m.address);
+    progress: (m) => console.log(`Progress: ${m.data.percent * 100}%`),
+    reconciled: (m) => {
+      const data = reconciler.read(m).binary();
+      console.log("Batch reconciled.");
+      reconciler.release(m.handle);
     },
     _: () => {},
   });
@@ -817,7 +982,7 @@ reconciler.subscribe((msg) => {
 
 ### Scenario 2: AI Media Transcoder
 
-Actors are perfect for "Burst Memory" tasks. Here, an actor converts an image, resetting the heartbeat during intensive pixel manipulation.
+Actors are perfect for burst memory tasks. Here, an actor converts an image, resetting the heartbeat during intensive pixel manipulation.
 
 ```typescript
 const supervisor = createSupervisor({
@@ -837,25 +1002,27 @@ const supervisor = createSupervisor({
 
 const transcoder = supervisor.spawn(async (self, msg, ctx) => {
   const rawImage = await ctx.resources.storage.get(msg.fileId);
-  
-  // Start high-gear work
-  const lock = await ctx.acquireLock();
-  
+
   // Pixel-by-pixel transformation with heartbeat
   for (let row = 0; row < rawImage.height; row++) {
     processRow(rawImage, row);
     ctx.heartbeat();  // Explicit heartbeat during CPU-intensive loop
   }
 
-  ctx.deposit(lock, rawImage.buffer);
-  ctx.done(lock);
-  
-  self.send({ type: 'TRANSCODED', fileId: msg.fileId });
+  // Write transcoded data to shared memory
+  const handle = await ctx.write({
+    msg: "transcoded",
+    type: "binary",
+    data: rawImage.buffer,
+    share: "owner",
+  });
+
+  self.send("done", { fileId: msg.fileId });
 });
 
 transcoder.subscribe((msg) => {
-  match(msg, {
-    TRANSCODED: (m) => println(`Transcoded: ${m.fileId}`),
+  matchAll(msg, {
+    done: (m) => console.log(`Transcoded: ${m.data.fileId}`),
     _: () => {}
   });
 });
@@ -863,7 +1030,7 @@ transcoder.subscribe((msg) => {
 
 ### Scenario 3: Intent-Based Tool Calling (Agentic)
 
-In an agentic workflow, the Resource Manager acts as the "Tool Belt" for the AI.
+In an agentic workflow, the Resource Manager acts as the Tool Belt for the AI.
 
 ```typescript
 const supervisor = createSupervisor({
@@ -890,64 +1057,72 @@ const supervisor = createSupervisor({
 const agent = supervisor.spawn(async (self, msg, ctx) => {
   // Agent decides it needs to search
   const searchResult = await ctx.resources.searchTool.find(msg.query);
-  
+
   // Then compute something
   const calcResult = await ctx.resources.calculator.compute('2+2');
-  
+
   matchAll(calcResult, {
-    Ok: (v) => self.send({ type: 'RESULT', data: { search: searchResult, calc: v.value } }),
-    Err: (e) => self.send({ type: 'ERROR', reason: e.error }),
+    Ok: (v) => self.send("result", { search: searchResult, calc: v.value }),
+    Err: (e) => self.send("error", { reason: e.error }),
     _: () => {}
   });
 });
 ```
 
-### Scenario 4: Fault-Tolerant Pipeline
+### Scenario 4: Fault-Tolerant Pipeline with Immutable Data
 
-Using supervision strategies to build a reliable processing pipeline.
+Using supervision strategies to build a reliable processing pipeline. Data flows through immutable Tier 2 boxes with group authorization.
 
 ```typescript
-const pipeline = supervisor.createGroup({ 
+const pipeline = supervisor.createGroup({
   strategy: 'rest-for-one'  // Restart downstream on upstream failure
 });
 
-// Stage 1: Data Ingest — deposits to Tier 2, main thread reads
+// Stage 1: Data Ingest
 const ingest = pipeline.spawn(async (self, msg, ctx) => {
   const rawData = await ctx.resources.storage.fetch(msg.url);
-  const lock = await ctx.acquireLock();
-  ctx.deposit(lock, rawData);
-  ctx.done(lock);  // Marks READY, fires DEPOSIT_READY
-  self.send({ type: 'INGESTED' });
+
+  // Write to shared memory, authorize group members
+  const handle = await ctx.write({
+    msg: "ingested",
+    type: "binary",
+    data: ctx.fmt.encode(rawData),
+    share: "group",
+  });
+  self.send("ready");
 });
 
-// Main thread subscriber reads Tier 2 data (actor.read is main-thread only)
-ingest.subscribe((msg) => {
+// Stage 2: Transformer
+const transform = pipeline.spawn(async (self, msg, ctx) => {
   matchAll(msg, {
-    DEPOSIT_READY: (m) => {
-      const data = ingest.read((m as any).address);
-      // Process on main thread, then forward via Tier 1
-      const transformed = data.map((x: number) => x * 2);
-      ingest.done((m as any).address);
-      transform.spawn({ data: transformed });
+    ingested: (m) => {
+      // Read the immutable data
+      const data = ctx.read(m).json();
+      const result = data.map((x: number) => x * 2).reduce((a: number, b: number) => a + b, 0);
+      ctx.release(m.handle);
+
+      // Write transformed result
+      ctx.write({
+        msg: "transformed",
+        type: "json",
+        data: ctx.fmt.encode({ result }),
+        share: "group",
+      }).andThen((handle) => {
+        self.send("ready");
+      });
     },
     _: () => {}
   });
 });
 
-// Stage 2: Transformer — receives data via Tier 1 message
-const transform = pipeline.spawn(async (self, msg, ctx) => {
-  const data = msg.data;
-  // Process inline — no outer scope capture
-  const result = data.reduce((sum: number, x: number) => sum + x, 0);
-  self.send({ type: 'TRANSFORMED', result });
-});
-
 // Stage 3: Output
 const output = pipeline.spawn(async (self, msg, ctx) => {
   matchAll(msg, {
-    TRANSFORMED: async (m) => {
-      await ctx.resources.storage.save((m as any).outputPath, (m as any).result);
-      self.send({ type: 'COMPLETE' });
+    transformed: async (m) => {
+      const result = ctx.read(m).json();
+      await ctx.resources.storage.save(msg.outputPath, result);
+      ctx.release(m.handle);
+      self.send("complete", { outputPath: msg.outputPath });
     },
     _: () => {}
   });
@@ -978,11 +1153,12 @@ const supervisor = createSupervisor({
       release: async () => {}
     }
   },
-  timeouts: { 
+  memory: { poolSize: 10, boxSize: '4mb' },
+  timeouts: {
     defaultLeaseMs: 60000,
-    actorTimeouts: { 
+    actorTimeouts: {
       'searcher': 30000,
-      'analyst': 120000 
+      'analyst': 120000
     }
   }
 });
@@ -990,35 +1166,40 @@ const supervisor = createSupervisor({
 // Searcher Agent
 const searcher = supervisor.spawn(
   async (self, msg, ctx) => {
-    const urls = msg.urls;  // Array of 50 URLs
+    const urls = msg.urls;
     let htmlData = '';
 
     for (const url of urls) {
       const html = await ctx.resources.webScraper.fetch(url);
       htmlData += html;
-      ctx.heartbeat();  // Keep lease alive during scraping
+      ctx.heartbeat();  // Keep write lease alive during scraping
 
       if (ctx.isCancelled) break;
     }
 
-    const lock = await ctx.acquireLock();
-    ctx.deposit(lock, ctx.fmt.encode(htmlData));
-    ctx.done(lock);
-    self.send({ type: 'SEARCH_COMPLETE' });
+    // Write scraped data to shared memory, share with linked actors
+    const handle = await ctx.write({
+      msg: "scraped",
+      type: "string",
+      data: ctx.fmt.encode(htmlData),
+      share: "linked",
+    });
+    self.send("search_done");
   },
   { name: 'searcher' }
 );
 
 // Analyst Agent (Linked to Searcher)
-// Receives data via Tier 1 message — cannot read searcher's deposit directly
-// (serialized callbacks lose outer scope)
 const analyst = supervisor.spawn(
   async (self, msg, ctx) => {
     matchAll(msg, {
-      SEARCH_COMPLETE: async (m) => {
-        const htmlData = (m as any).htmlData;
+      scraped: async (m) => {
+        // Read the immutable scraped data
+        const htmlData = ctx.read(m).string();
         const analysis = await ctx.resources.llm.analyze(htmlData);
-        self.send({ type: 'ANALYSIS_COMPLETE', result: analysis });
+        ctx.release(m.handle);
+
+        self.send("analysis", { result: analysis });
       },
       _: () => {}
     });
@@ -1029,11 +1210,12 @@ const analyst = supervisor.spawn(
 // Link: If Searcher dies, Analyst dies too
 await searcher.link(analyst);
 
-// Monitor the swarm
+// Monitor the swarm from main thread
 supervisor.subscribe((msg) => {
-  match(msg, {
-    ActorDown: (info) => println(`Agent ${info.name} died: ${info.reason}`),
-    ANALYSIS_COMPLETE: (r) => println("Swarm result:", r.result),
+  matchAll(msg, {
+    search_done: () => console.log("Search complete"),
+    analysis: (m) => console.log("Swarm result:", m.data.result),
+    DOWN: (info) => console.log(`Agent ${info.data.id} died: ${info.data.reason}`),
     _: () => {}
   });
 });
@@ -1068,19 +1250,92 @@ const supervisor = createSupervisor({
 const agent = supervisor.spawn(async (self, msg, ctx) => {
   // Search vector database
   const context = await ctx.resources.vectorDb.search(msg.query);
-  
-  // Generate with LLM
-  const lock = await ctx.acquireLock();
+
+  // Generate with LLM and write result to shared memory
   const response = await ctx.resources.llm.generate(context);
-  
-  ctx.deposit(lock, response);
-  ctx.done(lock);
-  
-  self.send({ type: 'COMPLETE' });
+
+  const handle = await ctx.write({
+    msg: "generated",
+    type: "json",
+    data: ctx.fmt.encode(response),
+    share: "owner",
+  });
+
+  self.send("complete");
+});
+
+// Main thread subscriber reads the generated content
+agent.subscribe((msg) => {
+  matchAll(msg, {
+    generated: (m) => {
+      const data = agent.read(m).json();
+      console.log("Generation result:", data);
+      agent.release(m.handle);
+    },
+    complete: () => console.log("Agent finished"),
+    _: () => {}
+  });
 });
 
 // Graceful shutdown triggers resource.release() calls
 process.on('SIGTERM', () => supervisor.shutdown());
+```
+
+### Scenario 7: Worker Protocol in Action
+
+Demonstrates the full protocol flow between worker and supervisor.
+
+```typescript
+// Inside actor callback:
+const handle = await ctx.write({
+  msg: "processed",
+  type: "json",
+  data: ctx.fmt.encode({ result: 42 }),
+  share: "group",
+});
+// Protocol flow:
+// 1. Worker sends: WRITE_REQUEST { msg: "processed", type: "json", data: ..., share: "group" }
+// 2. Supervisor assigns box, replies: WRITE_GRANTED { lock: { boxIndex: 3, epoch: 1 } }
+// 3. Worker copies data to SAB box[3], sends: COMMIT { lock: { boxIndex: 3, epoch: 1 } }
+// 4. Supervisor marks box READY, distributes INBOX messages to authorized readers
+// 5. Reader receives: INBOX { handle: { boxIndex: 3, epoch: 1 }, from: "actor-1", msg: "processed", type: "json" }
+
+// Inside reader callback:
+const result = ctx.read(m).json();
+// No async. Data already in SAB. Box is READY (immutable).
+ctx.release(m.handle);
+// Protocol flow:
+// 1. Worker sends: RELEASE { lock: { boxIndex: 3, epoch: 1 } }
+// 2. Supervisor decrements refCount. If 0: marks box FREE.
+```
+
+### Scenario 8: Tier 1 Only (Small Data, No SAB)
+
+For small payloads, use `self.send()` exclusively. No `handle` in the message, no `release` needed.
+
+```typescript
+const notifier = supervisor.spawn(async (self, msg, ctx) => {
+  // Tier 1 only - no shared memory needed
+  self.send("progress", { percent: 0.5 });
+
+  const result = await someAsyncWork();
+  self.send("done", { value: result });
+});
+
+notifier.subscribe((msg) => {
+  matchAll(msg, {
+    progress: (m) => {
+      // No handle - direct data access
+      const { percent } = m.data;
+      console.log(`Progress: ${percent * 100}%`);
+      // No release needed - Tier 1 messages have no handle
+    },
+    done: (m) => {
+      console.log("Result:", m.data.value);
+    },
+    _: () => {},
+  });
+});
 ```
 
 ---
@@ -1091,23 +1346,26 @@ process.on('SIGTERM', () => supervisor.shutdown());
 | --- | --- |
 | **Actor Isolation** | Callbacks are serialized, outer scope not inherited. All state via `msg` or `ctx`. Enables safe termination. |
 | **On-Demand Termination** | Any actor can be terminated from userland via `actor.terminate()` or `supervisor.terminateActor(id)`. |
-| **Two-Tier Communication** | Tier 1: PubSub (signals, heartbeats, resource intents). Tier 2: Atomic-locked shared memory (zero-copy data). |
-| **Memory Pool** | Fixed-size boxes (configurable `poolSize` and `boxSize`). FIFO queuing for lock acquisition. |
-| **Opportunistic Cleanup** | Calculate `expiresAt` on lock acquisition. Check and cleanup on any interaction. No setTimeout overhead. |
-| **Heartbeats** | Implicit on `self.send()`, `ctx.deposit()`. Explicit via `ctx.heartbeat()`. |
+| **Two-Tier Communication** | Tier 1: PubSub (signals, heartbeats, resource intents). Tier 2: Immutable SAB boxes (zero-copy data). |
+| **Memory Pool** | Fixed-size boxes (configurable `poolSize` and `boxSize`). Queue-based assignment. No CAS. |
+| **Immutable Data** | Boxes are READY (immutable) after commit. No READING state. Safe concurrent reads without synchronization. |
+| **Per-Actor Inbox** | Supervisor routes messages to actor inboxes. Inbox entries hold Lock references, not data copies. |
+| **Authorization** | `ShareConfig`: owner (default), group, linked, or explicit ActorId list. Enforced at inbox delivery. |
+| **Opportunistic Cleanup** | Calculate `expiresAt` on commit. Check and cleanup on any interaction. No setTimeout overhead. |
+| **Heartbeats** | Implicit on `self.send()`, `ctx.write()`, `ctx.release()`. Explicit via `ctx.heartbeat()`. |
 | **Resource Manager** | Proxy-based intent relay. Each resource has `release()` for cleanup. Zod schemas for input/output validation. |
 | **Supervision** | one-for-one, one-for-all, rest-for-one strategies with retry configuration. |
-| **Linking** | Bi-directional (ctx.link) or uni-directional (ctx.monitor). |
+| **Linking** | Bi-directional (`ctx.link`) or uni-directional (`ctx.monitor`). |
 | **Error Handling** | slang-ts Result types. Errors serialized across Tier 1. |
-| **Buffer & Serialization** | `ctx.fmt.alloc()`, `ctx.fmt.from()`, `ctx.fmt.encode/decode()` for zero-abstract buffer/serialization DX. |
-| **Testing** | Constraint, happy path, non-happy path, and edge case tests per feature. |
-| **Diagnostics** | Configurable embedded metrics: actor lifetimes, start times, process lifetimes, lock times, buffer utilization. |
+| **Buffer & Serialization** | `ctx.fmt.alloc()`, `ctx.fmt.from()`, `ctx.fmt.encode/decode()` for zero-abstract buffer and serialization DX. |
+| **Testing** | Constraint, happy path, non-happy path, and edge case tests per feature. Key invariants enforced. |
+| **Diagnostics** | Configurable embedded metrics: actor lifetimes, write queue depth, buffer utilization, inbox depth, authorization events. |
 
 ---
 
 ## 20. Pitch
 
-> "@nilejs/future turns your Bun runtime into a multi-lane highway. It combines **Atomic Shared Memory** with **Erlang-style Supervision**, letting you build AI agent swarms and high-throughput systems that are physically impossible to build with standard JS. It's not just a library, it is a runtime upgrade for the Agentic Era."
+> @nilejs/future turns your Bun runtime into an Erlang-style actor system. It combines **immutable shared memory** with **Erlang-style supervision**, letting you build AI agent swarms and high-throughput systems with deterministic message routing, transparent authorization, and zero-copy data transfer. It is not just a library, it is a runtime upgrade for the Agentic Era.
 
 ### The Problem It Solves
 
@@ -1118,6 +1376,7 @@ Standard JavaScript has no built-in protection against:
 - Functions that consume all memory
 - Unreleased resources from crashed code
 - Cascading failures that bring down your entire system
+- Accidental data sharing and corruption between concurrent tasks
 
 ### The Solution
 
@@ -1126,13 +1385,16 @@ Standard JavaScript has no built-in protection against:
 - Hanging code is automatically killed via heartbeat timeout
 - Resource cleanup is guaranteed on termination
 - One actor's failure cannot corrupt others
+- Data is immutable after commit; safe concurrent reads without locks
+- Authorization is enforced at the supervisor level; actors cannot impersonate each other
 
 ### For Agentic Workflows
 
-* **The "Thinking" Sandbox:** Wrap AI agents in actors. If they enter infinite loops, the Lease and Heartbeat system kills and recovers automatically.
-* **Streaming High-Volume Context:** Use Tier 2 Deposits for zero-copy sharing of large context windows between agents.
+* **The Thinking Sandbox:** Wrap AI agents in actors. If they enter infinite loops, the Lease and Heartbeat system kills and recovers automatically.
+* **Streaming High-Volume Context:** Use Tier 2 writes for zero-copy sharing of large context windows between agents.
 * **Supervision Trees:** Use rest-for-one to automatically reset downstream agents when upstream fails.
+* **Multi-Agent Authorization:** Use `ShareConfig` to control which agents see which data. No accidental context leaks between agents.
 
 ---
 
-*This spec generalizes the core patterns while preserving all implementation details. The architecture balances performance (atomic operations, zero-copy), reliability (supervision strategies, lease system), and developer experience (proxy-based resources, intuitive DSL).*
+*This specification defines the Two-Tier actor model with immutable data, supervisor-mediated inbox routing, and transparent authorization. The architecture balances performance (zero-copy SAB, no CAS contention), reliability (supervision strategies, lease system), and developer experience (chainable readers, proxy-based resources, intuitive DSL).*

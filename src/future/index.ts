@@ -12,23 +12,26 @@ export type {
   ActorGroupConfig,
   ActorRef,
   ActorSelf,
-  BoxState,
+  BoxEntry,
+  ChainableReader,
   DiagnosticsConfig,
+  FmtType,
   FormatUtils,
+  InboxEntry,
   Lock,
   MemoryConfig,
+  Message,
   ResourceConfig,
+  ResourceMethodConfig,
   ResourcesConfig,
   RetryConfig,
+  ShareConfig,
   Supervisor,
   SupervisorConfig,
   SupervisorDiagnostics,
   SupervisionStrategy,
   TimeoutConfig,
 } from "./types";
-
-// Constants
-export { BOX_CLEAN, BOX_LOCKED, BOX_READY, BOX_READING } from "./types";
 
 // Public API
 export { createSupervisor } from "./supervisor";

@@ -1,11 +1,7 @@
 /**
  * Worker thread entry point for @nilejs/future actors.
- *
- * Receives INIT message with serialized callback, reconstructs it, then
- * listens for SPAWN messages to create ActorSelf + ActorContext and execute
- * the callback. Handles LOCK_GRANTED, RESOURCE_RESPONSE, RESOURCE_ERROR,
- * and TERMINATE messages from the main thread.
- *
+ * Receives INIT → reconstructs callback. SPAWN → runs callback with self+ctx.
+ * Handles WRITE_GRANTED, INBOX, RESOURCE_*, CHILD_*, TERMINATE from main thread.
  * @module worker-bootstrap
  */
 
@@ -14,55 +10,29 @@ import { Ok, Err } from "../result";
 import { safeTry } from "../safe-try";
 import type { Result } from "../result";
 import type {
-  ActorSelf,
-  ActorContext,
-  ActorCallback,
-  ActorRef,
-  FormatUtils,
-  Lock,
-  WorkerInitPayload,
-  WorkerSpawnPayload,
-  SupervisorConfig,
-  ChildSpawnedMessage,
-  ChildSpawnErrorMessage,
-  ReadGrantedMessage,
-  ReadErrorMessage,
+  ActorSelf, ActorContext, ActorCallback, ActorRef, FormatUtils,
+  Lock, Message, WorkerInitPayload, WorkerSpawnPayload, SupervisorConfig,
+  ChildSpawnedMessage, ChildSpawnErrorMessage, InboxMessage, WriteGrantedMessage,
 } from "./types";
 
-// ============================================================================
-// Guard — must run inside a worker thread
-// ============================================================================
+if (!parentPort) throw new Error("worker-bootstrap must run inside a worker thread");
 
-if (!parentPort) {
-  throw new Error("worker-bootstrap must run inside a worker thread");
-}
+// --- Internal types ---
 
-// ============================================================================
-// Internal message types not in shared types
-// ============================================================================
-
-/** Main thread confirms lock acquisition */
-type LockGrantedMessage = {
-  readonly type: "LOCK_GRANTED";
-  readonly lock: Lock;
-};
-
-/** Discriminated union for all incoming messages we handle */
 type IncomingMessage =
-  | WorkerInitPayload
-  | WorkerSpawnPayload
-  | LockGrantedMessage
-  | ReadGrantedMessage
-  | ReadErrorMessage
+  | WorkerInitPayload | WorkerSpawnPayload | WriteGrantedMessage | InboxMessage
   | { readonly type: "TERMINATE" }
   | { readonly type: "RESOURCE_RESPONSE"; readonly id: string; readonly result: unknown }
   | { readonly type: "RESOURCE_ERROR"; readonly id: string; readonly error: string }
-  | ChildSpawnedMessage
-  | ChildSpawnErrorMessage;
+  | ChildSpawnedMessage | ChildSpawnErrorMessage;
 
-// ============================================================================
-// Mutable state — lives for worker lifetime
-// ============================================================================
+type PendingEntry = {
+  resolve: (value: unknown) => void;
+  reject: (error: string) => void;
+  timer: ReturnType<typeof setTimeout> | null;
+};
+
+// --- Mutable state ---
 
 let actorId: string;
 let callback: ActorCallback;
@@ -70,332 +40,216 @@ let config: Pick<SupervisorConfig, "memory" | "timeouts">;
 let isCancelled = false;
 let sab: SharedArrayBuffer;
 
-/** Pending resource requests awaiting RESPONSE or ERROR */
-const pendingResourceRequests = new Map<
-  string,
-  {
-    resolve: (value: unknown) => void;
-    reject: (error: string) => void;
-    timer: ReturnType<typeof setTimeout> | null;
-  }
->();
+const pendingResourceRequests = new Map<string, PendingEntry>();
+let pendingWrite: { resolve: (lock: Lock) => void; reject: (error: string) => void } | null = null;
+const pendingChildSpawns = new Map<string, PendingEntry>();
 
-/** Pending lock request awaiting LOCK_GRANTED */
-let pendingLock: {
-  resolve: (lock: Lock) => void;
-  reject: (error: string) => void;
-} | null = null;
-
-/** Pending read requests awaiting READ_GRANTED or READ_ERROR, keyed by requestId */
-const pendingReads = new Map<
-  string,
-  { resolve: (data: Uint8Array) => void; reject: (error: string) => void }
->();
-
-/** Monotonic counter for unique read request IDs */
-let readRequestIdCounter = 0;
-
-/** Pending child spawn requests awaiting CHILD_SPAWNED or CHILD_SPAWN_ERROR */
-const pendingChildSpawns = new Map<
-  string,
-  {
-    resolve: (childId: string) => void;
-    reject: (err: string) => void;
-    timer: ReturnType<typeof setTimeout> | null;
-  }
->();
-
-// ============================================================================
-// Port helper
-// ============================================================================
+// --- Port helper ---
 
 const port = parentPort!;
 
-/** Post a message to the main thread */
 function postToMain(msg: Record<string, unknown>): void {
   port.postMessage(msg);
 }
 
-// ============================================================================
-// FormatUtils — local utilities, no postMessage needed
-// ============================================================================
+// --- FormatUtils ---
 
-/** Safely parse JSON string, returning discriminated result instead of throwing */
 function safeParseJson(str: string): { readonly ok: true; readonly value: unknown } | { readonly ok: false } {
-  try {
-    return { ok: true, value: JSON.parse(str) };
-  } catch {
-    return { ok: false };
-  }
+  try { return { ok: true, value: JSON.parse(str) }; }
+  catch { return { ok: false }; }
 }
 
-/** Create FormatUtils instance with TextEncoder/Decoder for encoding ops */
 function createFormatUtils(): FormatUtils {
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
-
   const encodeString = (str: string): Uint8Array => encoder.encode(str);
-  const encodeJson = (obj: unknown): Uint8Array =>
-    encoder.encode(JSON.stringify(obj));
+  const encodeJson = (obj: unknown): Uint8Array => encoder.encode(JSON.stringify(obj));
+
+  const allocBase = (size: number): Uint8Array => new Uint8Array(size);
+  const alloc = Object.assign(allocBase, {
+    u8: (length: number) => new Uint8Array(length),
+    i8: (length: number) => new Int8Array(length),
+    u16: (length: number) => new Uint16Array(length),
+    i16: (length: number) => new Int16Array(length),
+    u32: (length: number) => new Uint32Array(length),
+    i32: (length: number) => new Int32Array(length),
+    u64: (length: number) => new BigUint64Array(length),
+    i64: (length: number) => new BigInt64Array(length),
+    f32: (length: number) => new Float32Array(length),
+    f64: (length: number) => new Float64Array(length),
+  });
+
+  const coerce = (data: unknown): Uint8Array => {
+    if (data instanceof Uint8Array) return data;
+    if (typeof data === "string") return encodeString(data);
+    return encodeJson(data);
+  };
 
   return {
-    alloc: (size) => new Uint8Array(size),
-    allocU8: (length) => new Uint8Array(length),
-    allocI8: (length) => new Int8Array(length),
-    allocU16: (length) => new Uint16Array(length),
-    allocI16: (length) => new Int16Array(length),
-    allocU32: (length) => new Uint32Array(length),
-    allocI32: (length) => new Int32Array(length),
-    allocU64: (length) => new BigUint64Array(length),
-    allocI64: (length) => new BigInt64Array(length),
-    allocF32: (length) => new Float32Array(length),
-    allocF64: (length) => new Float64Array(length),
-    from: (data) => {
-      if (data instanceof Uint8Array) return data;
-      if (typeof data === "string") return encodeString(data);
-      return encodeJson(data);
-    },
-    encode: (data) => {
-      if (data instanceof Uint8Array) return data;
-      if (typeof data === "string") return encodeString(data);
-      return encodeJson(data);
-    },
+    alloc,
+    from: coerce,
+    encode: coerce,
     decode: (buffer) => {
       const str = decoder.decode(buffer);
       const parsed = safeParseJson(str);
       return parsed.ok ? parsed.value : str;
     },
-    json: {
-      encode: (obj) => encodeJson(obj),
-      decode: (buf) => JSON.parse(decoder.decode(buf)),
-    },
-    string: {
-      encode: (str) => encodeString(str),
-      decode: (buf) => decoder.decode(buf),
+    json: { encode: (obj) => encodeJson(obj), decode: (buf) => JSON.parse(decoder.decode(buf)) },
+    string: { encode: (str) => encodeString(str), decode: (buf) => decoder.decode(buf) },
+    cbor: {
+      encode: () => { throw new Error("CBOR codec not configured"); },
+      decode: () => { throw new Error("CBOR codec not configured"); },
     },
   };
 }
 
-// ============================================================================
-// ActorSelf factory
-// ============================================================================
+// --- ActorSelf ---
 
-/** Create ActorSelf — the actor's identity and send handle */
 function createActorSelf(): ActorSelf {
   return {
     id: actorId,
-    send: (msg) => postToMain({ type: "SEND", msg }),
+    send: (msg, data) => postToMain({ type: "SEND", msg, data }),
   };
 }
 
-// ============================================================================
-// Resource proxy — intent relay to main thread
-// ============================================================================
+// --- Resource proxy ---
 
-/**
- * Creates a double-proxy for resource access.
- * `ctx.resources.db.query("SELECT ...")` →
- *   postMessage { type: 'RESOURCE_REQUEST', id, resource: 'db', method: 'query', args: ["SELECT ..."] }
- *   → waits for RESOURCE_RESPONSE or RESOURCE_ERROR
- */
 function createResourcesProxy(): ActorContext["resources"] {
   return new Proxy(
     {} as Record<string, Record<string, (...args: unknown[]) => Promise<unknown>>>,
     {
-      get: (_target, resource: string) => {
-        return new Proxy(
-          {} as Record<string, (...args: unknown[]) => Promise<unknown>>,
-          {
-            get: (_target, method: string) => {
-              return (...args: unknown[]) => {
-                return new Promise<unknown>((resolve, reject) => {
-                  const id = `${resource}.${method}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-                  const timeout = config.timeouts?.defaultLeaseMs ?? 30_000;
-
-                  const timer = setTimeout(() => {
-                    pendingResourceRequests.delete(id);
-                    reject(`Resource request timeout: ${resource}.${method}`);
-                  }, timeout);
-
-                  pendingResourceRequests.set(id, { resolve, reject, timer });
-
-                  postToMain({
-                    type: "RESOURCE_REQUEST",
-                    id,
-                    resource,
-                    method,
-                    args,
-                  });
-                });
-              };
-            },
-          },
-        );
-      },
+      get: (_t, resource: string) => new Proxy(
+        {} as Record<string, (...args: unknown[]) => Promise<unknown>>,
+        {
+          get: (_t, method: string) => (...args: unknown[]) =>
+            new Promise<unknown>((resolve, reject) => {
+              const id = `${resource}.${method}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+              const timeout = config.timeouts?.defaultLeaseMs ?? 30_000;
+              const timer = setTimeout(() => {
+                pendingResourceRequests.delete(id);
+                reject(`Resource request timeout: ${resource}.${method}`);
+              }, timeout);
+              pendingResourceRequests.set(id, { resolve, reject, timer });
+              postToMain({ type: "RESOURCE_REQUEST", id, resource, method, args });
+            }),
+        },
+      ),
     },
   );
 }
 
-// ============================================================================
-// ActorContext factory
-// ============================================================================
+// --- ActorContext ---
 
-/** Create ActorContext — the full execution context for an actor callback */
 function createActorContext(): ActorContext {
   const fmt = createFormatUtils();
   const resources = createResourcesProxy();
+  const decoder = new TextDecoder();
 
   return {
     heartbeat: () => postToMain({ type: "HEARTBEAT" }),
+    terminate: () => { postToMain({ type: "TERMINATE" }); process.exit(0); },
+    get isCancelled() { return isCancelled; },
 
-    terminate: () => {
-      postToMain({ type: "TERMINATE" });
-      process.exit(0);
+    /** Acquire box → copy data → commit. WRITE_REQUEST → WRITE_GRANTED → COMMIT. */
+    write: (params) => new Promise<Result<Lock, string>>((resolve) => {
+      const { msg, type, data, share = "owner" } = params;
+      pendingWrite = {
+        resolve: (lock) => {
+          const boxSize = Number(config.memory.boxSize);
+          const offset = lock.boxIndex * boxSize;
+          const view = new Uint8Array(sab, offset, Math.min(data.length, boxSize));
+          view.set(data.subarray(0, boxSize));
+          postToMain({ type: "COMMIT", lock });
+          resolve(Ok(lock));
+        },
+        reject: (err) => resolve(Err(err)),
+      };
+      postToMain({ type: "WRITE_REQUEST", msg, fmt: type, data, share });
+    }),
+
+    /** Sync read from SAB. Returns null for Tier 1 (no handle). */
+    read: (msg: Message) => {
+      if (!msg.handle) return null;
+      const boxSize = Number(config.memory.boxSize);
+      const offset = msg.handle.boxIndex * boxSize;
+      const view = new Uint8Array(sab, offset, boxSize);
+      /** Strip trailing null bytes for text/JSON decoding (SAB is zero-initialized) */
+      const stripNulls = (bytes: Uint8Array): Uint8Array => {
+        let end = bytes.length;
+        while (end > 0 && bytes[end - 1] === 0) end--;
+        return bytes.subarray(0, end);
+      };
+      return {
+        json: () => JSON.parse(decoder.decode(stripNulls(view))),
+        string: () => decoder.decode(stripNulls(view)),
+        binary: () => new Uint8Array(view),
+        cbor: () => { throw new Error("CBOR not implemented"); },
+        raw: () => new Uint8Array(view),
+      };
     },
 
-    get isCancelled() {
-      return isCancelled;
-    },
-
-    acquireLock: (): Promise<Result<Lock, string>> => {
-      return new Promise<Result<Lock, string>>((resolve) => {
-        pendingLock = {
-          resolve: (lock) => resolve(Ok(lock)),
-          reject: (err) => resolve(Err(err)),
-        };
-        postToMain({ type: "LOCK_REQUEST" });
-      });
-    },
-
-    deposit: (lock, data) => {
-      const view = new Uint8Array(sab, lock.byteOffset, lock.length);
-      view.set(data.subarray(0, lock.length));
-      postToMain({ type: "DEPOSIT" });
-    },
-
-    done: (lock) => postToMain({ type: "DONE", lock }),
-
-    read: (lock: Lock): Promise<Result<Uint8Array, string>> => {
-      return new Promise<Result<Uint8Array, string>>((resolve) => {
-        const requestId = `read-${++readRequestIdCounter}-${Date.now()}`;
-        pendingReads.set(requestId, {
-          resolve: (data) => resolve(Ok(data)),
-          reject: (err) => resolve(Err(err)),
-        });
-        postToMain({ type: "READ_START", lock, requestId });
-      });
-    },
-
+    release: (handle) => postToMain({ type: "RELEASE", lock: handle }),
     resources,
+    link: (actor: ActorRef) => postToMain({ type: "LINK", actorId: actor.id }),
+    monitor: (actor: ActorRef) => postToMain({ type: "MONITOR", actorId: actor.id }),
 
-    link: (actor: ActorRef) =>
-      postToMain({ type: "LINK", actorId: actor.id }),
-
-    monitor: (actor: ActorRef) =>
-      postToMain({ type: "MONITOR", actorId: actor.id }),
-
-    spawn: (callback: ActorCallback): Promise<ActorRef> => {
-      return new Promise<ActorRef>((resolve, reject) => {
+    spawn: (childCallback: ActorCallback): Promise<ActorRef> =>
+      new Promise<ActorRef>((resolve, reject) => {
         const requestId = `child-spawn-${Date.now()}-${Math.random().toString(36).slice(2)}`;
         const timeout = config.timeouts?.defaultLeaseMs ?? 5000;
-
         const timer = setTimeout(() => {
           if (pendingChildSpawns.has(requestId)) {
             pendingChildSpawns.delete(requestId);
             reject("Child spawn timeout");
           }
         }, timeout);
-
         pendingChildSpawns.set(requestId, {
-          resolve: (childId) => resolve(createChildActorRef(childId)),
-          reject,
-          timer,
+          resolve: (childId) => resolve(createChildActorRef(childId as string)),
+          reject, timer,
         });
-
-        postToMain({
-          type: "SPAWN_CHILD",
-          requestId,
-          callback: callback.toString(),
-          config: {},
-        });
-      });
-    },
+        postToMain({ type: "SPAWN_CHILD", requestId, callback: childCallback.toString(), config: {} });
+      }),
 
     fmt,
   };
 }
 
-// ============================================================================
-// Child ActorRef factory — minimal proxy for spawned children
-// ============================================================================
+// --- Child ActorRef ---
 
-/** Create a minimal ActorRef for a child actor. Full proxy methods require main-thread relay. */
 function createChildActorRef(childId: string): ActorRef {
+  const throwCtx = () => { throw new Error("Not available in worker context"); };
   return {
     id: childId,
-    spawn: () => {
-      throw new Error("ActorRef.spawn not available in worker context");
-    },
-    subscribe: () => {
-      throw new Error("ActorRef.subscribe not available in worker context");
-    },
+    spawn: throwCtx,
+    subscribe: throwCtx,
     terminate: () => postToMain({ type: "TERMINATE_CHILD", childId }),
-    read: () => {
-      throw new Error("ActorRef.read not available in worker context");
-    },
-    done: () => {
-      throw new Error("ActorRef.done not available in worker context");
-    },
+    read: throwCtx,
+    release: throwCtx,
     getDiagnostics: () => Err("Diagnostics not available in worker context"),
-    link: (other: ActorRef) =>
-      postToMain({ type: "LINK", actorId: other.id, fromId: childId }),
-    monitor: (other: ActorRef) =>
-      postToMain({ type: "MONITOR", actorId: other.id, fromId: childId }),
+    link: (other: ActorRef) => postToMain({ type: "LINK", actorId: other.id, fromId: childId }),
+    monitor: (other: ActorRef) => postToMain({ type: "MONITOR", actorId: other.id, fromId: childId }),
   };
 }
 
-// ============================================================================
-// Cleanup — reject all pending requests
-// ============================================================================
+// --- Cleanup ---
 
-/** Reject all pending locks, reads, resource requests, and child spawns on termination */
 function rejectAllPending(reason: string): void {
-  if (pendingLock) {
-    pendingLock.reject(reason);
-    pendingLock = null;
-  }
-
-  for (const [, pending] of pendingReads) {
-    pending.reject(reason);
-  }
-  pendingReads.clear();
-
-  for (const [, pending] of pendingResourceRequests) {
-    if (pending.timer) clearTimeout(pending.timer);
-    pending.reject(reason);
-  }
+  if (pendingWrite) { pendingWrite.reject(reason); pendingWrite = null; }
+  for (const [, p] of pendingResourceRequests) { if (p.timer) clearTimeout(p.timer); p.reject(reason); }
   pendingResourceRequests.clear();
-
-  for (const [, pending] of pendingChildSpawns) {
-    if (pending.timer) clearTimeout(pending.timer);
-    pending.reject(reason);
-  }
+  for (const [, p] of pendingChildSpawns) { if (p.timer) clearTimeout(p.timer); p.reject(reason); }
   pendingChildSpawns.clear();
 }
 
-// ============================================================================
-// Message handler — dispatch by msg.type
-// ============================================================================
+// --- Message handlers ---
 
-/** Handle INIT: reconstruct callback, store config */
 function handleInit(msg: WorkerInitPayload): void {
   actorId = msg.actorId;
   config = msg.config;
   sab = (workerData as { sab: SharedArrayBuffer }).sab;
 
-  // Validate: reject strings with dangerous patterns to prevent code injection
-  const dangerousPatterns = [/\brequire\s*\(/, /\bprocess\b/, /\bglobalThis\b/, /\bimport\s*\(/, /\beval\s*\(/, /\bFunction\s*\(/];
-  if (dangerousPatterns.some((p) => p.test(msg.callback))) {
+  const dangerous = [/\brequire\s*\(/, /\bprocess\b/, /\bglobalThis\b/, /\bimport\s*\(/, /\beval\s*\(/, /\bFunction\s*\(/];
+  if (dangerous.some((p) => p.test(msg.callback))) {
     postToMain({ type: "ERROR", error: "Callback contains potentially dangerous code patterns" });
     process.exit(1);
     return;
@@ -403,138 +257,98 @@ function handleInit(msg: WorkerInitPayload): void {
 
   const fn = new Function("return " + msg.callback)() as unknown;
   if (typeof fn !== "function") {
-    postToMain({
-      type: "ERROR",
-      error: "Invalid callback: reconstructed value is not a function",
-    });
+    postToMain({ type: "ERROR", error: "Invalid callback: reconstructed value is not a function" });
     process.exit(1);
     return;
   }
-
   callback = fn as ActorCallback;
 }
 
-/** Handle SPAWN: create self + ctx, run callback, catch errors */
 async function handleSpawn(msg: WorkerSpawnPayload): Promise<void> {
   const self = createActorSelf();
   const ctx = createActorContext();
-
   const result = await safeTry(() => callback(self, msg.data, ctx));
-  if (result.isErr) {
-    postToMain({ type: "ERROR", error: result.error });
-  }
+  if (result.isErr) postToMain({ type: "ERROR", error: result.error });
 }
 
-/** Handle TERMINATE from main: set cancelled flag, clean up, exit */
 function handleTerminate(): void {
   isCancelled = true;
   rejectAllPending("Actor terminated by main thread");
   process.exit(0);
 }
 
-/** Handle LOCK_GRANTED: resolve pending lock request */
-function handleLockGranted(msg: LockGrantedMessage): void {
-  if (pendingLock) {
-    pendingLock.resolve(msg.lock);
-    pendingLock = null;
-  }
+function handleWriteGranted(msg: WriteGrantedMessage): void {
+  if (pendingWrite) { pendingWrite.resolve(msg.lock); pendingWrite = null; }
 }
 
-/** Handle READ_GRANTED: resolve pending read request with data from SAB */
-function handleReadGranted(msg: ReadGrantedMessage): void {
-  const pending = pendingReads.get(msg.requestId);
-  if (!pending) return;
-
-  const view = new Uint8Array(sab, msg.lock.byteOffset, msg.lock.length);
-  const data = new Uint8Array(view);
-  pending.resolve(data);
-  pendingReads.delete(msg.requestId);
+function handleInbox(msg: InboxMessage): void {
+  const self = createActorSelf();
+  const ctx = createActorContext();
+  const message: Message = { msg: msg.msg, type: msg.fmt, handle: msg.handle, from: msg.from };
+  safeTry(() => callback(self, message, ctx)).then((result) => {
+    if (result.isErr) postToMain({ type: "ERROR", error: result.error });
+  });
 }
 
-/** Handle READ_ERROR: reject pending read request */
-function handleReadError(msg: ReadErrorMessage): void {
-  const pending = pendingReads.get(msg.requestId);
-  if (!pending) return;
-
-  pending.reject(msg.error);
-  pendingReads.delete(msg.requestId);
-}
-
-/** Handle RESOURCE_RESPONSE: resolve pending resource request */
 function handleResourceResponse(id: string, result: unknown): void {
   const pending = pendingResourceRequests.get(id);
   if (!pending) return;
-
   if (pending.timer) clearTimeout(pending.timer);
   pending.resolve(result);
   pendingResourceRequests.delete(id);
 }
 
-/** Handle RESOURCE_ERROR: reject pending resource request */
 function handleResourceError(id: string, error: string): void {
   const pending = pendingResourceRequests.get(id);
   if (!pending) return;
-
   if (pending.timer) clearTimeout(pending.timer);
   pending.reject(error);
   pendingResourceRequests.delete(id);
 }
 
-/** Handle CHILD_SPAWNED: resolve pending child spawn request */
 function handleChildSpawned(msg: ChildSpawnedMessage): void {
   const pending = pendingChildSpawns.get(msg.requestId);
   if (!pending) return;
-
   if (pending.timer) clearTimeout(pending.timer);
   pending.resolve(msg.childId);
   pendingChildSpawns.delete(msg.requestId);
 }
 
-/** Handle CHILD_SPAWN_ERROR: reject pending child spawn request */
 function handleChildSpawnError(msg: ChildSpawnErrorMessage): void {
   const pending = pendingChildSpawns.get(msg.requestId);
   if (!pending) return;
-
   if (pending.timer) clearTimeout(pending.timer);
   pending.reject(msg.error);
   pendingChildSpawns.delete(msg.requestId);
 }
 
-// ============================================================================
-// Main message dispatch
-// ============================================================================
+// --- Dispatch ---
 
-/** Message type → handler map for incoming main-to-worker messages */
 const incomingHandlers: Record<string, (msg: IncomingMessage) => void | Promise<void>> = {
   INIT: (msg) => handleInit(msg as WorkerInitPayload),
   SPAWN: (msg) => handleSpawn(msg as WorkerSpawnPayload),
   TERMINATE: () => handleTerminate(),
-  LOCK_GRANTED: (msg) => handleLockGranted(msg as LockGrantedMessage),
-  READ_GRANTED: (msg) => handleReadGranted(msg as ReadGrantedMessage),
-  READ_ERROR: (msg) => handleReadError(msg as ReadErrorMessage),
-  RESOURCE_RESPONSE: (msg) => handleResourceResponse((msg as any).id, (msg as any).result),
-  RESOURCE_ERROR: (msg) => handleResourceError((msg as any).id, (msg as any).error),
+  WRITE_GRANTED: (msg) => handleWriteGranted(msg as WriteGrantedMessage),
+  INBOX: (msg) => handleInbox(msg as InboxMessage),
+  RESOURCE_RESPONSE: (msg) => {
+    const m = msg as { readonly id: string; readonly result: unknown };
+    handleResourceResponse(m.id, m.result);
+  },
+  RESOURCE_ERROR: (msg) => {
+    const m = msg as { readonly id: string; readonly error: string };
+    handleResourceError(m.id, m.error);
+  },
   CHILD_SPAWNED: (msg) => handleChildSpawned(msg as ChildSpawnedMessage),
   CHILD_SPAWN_ERROR: (msg) => handleChildSpawnError(msg as ChildSpawnErrorMessage),
 };
 
-/**
- * Dispatch incoming messages by type.
- * INIT must arrive before SPAWN. Other messages handled independently.
- */
 function handleMessage(raw: unknown): void {
   const msg = raw as IncomingMessage;
   const handler = incomingHandlers[msg.type];
   if (handler) {
     const result = handler(msg);
-    if (result instanceof Promise) {
-      result.catch(() => {});
-    }
+    if (result instanceof Promise) result.catch(() => {});
   }
 }
-
-// ============================================================================
-// Bootstrap — attach listener
-// ============================================================================
 
 port.on("message", handleMessage);

@@ -5,6 +5,8 @@ import type {
   ActorRef,
   Lock,
   MainToWorkerMessage,
+  Message,
+  ChainableReader,
 } from "./types";
 
 /**
@@ -14,10 +16,10 @@ import type {
 export function createActorRef(options: {
   readonly id: ActorId;
   readonly sendToWorker: (msg: MainToWorkerMessage) => void;
-  readonly subscribeToMessages: (fn: (msg: unknown) => void) => () => void;
+  readonly subscribeToMessages: (fn: (msg: Message) => void) => () => void;
   readonly terminate: () => void;
-  readonly readBox: (lock: Lock) => Uint8Array;
-  readonly doneBox: (lock: Lock) => void;
+  readonly readFromBox: (msg: Message) => ChainableReader | null;
+  readonly releaseBox: (handle: Lock) => void;
   readonly getDiagnostics: () => Result<ActorDiagnostics, string>;
   readonly linkTo: (otherId: string) => void;
   readonly monitor: (otherId: string) => void;
@@ -27,8 +29,8 @@ export function createActorRef(options: {
     sendToWorker,
     subscribeToMessages,
     terminate,
-    readBox,
-    doneBox,
+    readFromBox,
+    releaseBox,
     getDiagnostics,
     linkTo,
     monitor,
@@ -38,16 +40,16 @@ export function createActorRef(options: {
     sendToWorker({ type: "SPAWN", data: msg });
   };
 
-  const subscribe = (fn: (msg: unknown) => void): (() => void) => {
+  const subscribe = (fn: (msg: Message) => void): (() => void) => {
     return subscribeToMessages(fn);
   };
 
-  const read = (lock: Lock): Uint8Array => {
-    return readBox(lock);
+  const read = (msg: Message): ChainableReader | null => {
+    return readFromBox(msg);
   };
 
-  const done = (lock: Lock): void => {
-    doneBox(lock);
+  const release = (handle: Lock): void => {
+    releaseBox(handle);
   };
 
   const link = (other: ActorRef): void => {
@@ -64,7 +66,7 @@ export function createActorRef(options: {
     subscribe,
     terminate,
     read,
-    done,
+    release,
     getDiagnostics,
     link,
     monitor: monitorActor,

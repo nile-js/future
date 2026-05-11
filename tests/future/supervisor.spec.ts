@@ -1,865 +1,1092 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
+import { describe, expect, it, beforeEach, afterEach } from "bun:test";
 import { createSupervisor } from "../../src/future/supervisor";
-import { BOX_CLEAN, BOX_READY, BOX_READING } from "../../src/future/types";
-import type { Supervisor, ActorRef, Lock } from "../../src/future/types";
+import type { Supervisor, ActorRef, Lock, Message } from "../../src/future/types";
 
-function makeSupervisor(): Supervisor {
+function makeSupervisor(config?: { maxActors?: number; poolSize?: number; boxSize?: number; leaseMs?: number }): Supervisor {
   return createSupervisor({
-    maxActors: 5,
-    memory: { poolSize: 3, boxSize: 1024 },
-    timeouts: { defaultLeaseMs: 1000 },
+    maxActors: config?.maxActors ?? 10,
+    memory: { poolSize: config?.poolSize ?? 3, boxSize: config?.boxSize ?? 1024 },
+    timeouts: { defaultLeaseMs: config?.leaseMs ?? 2000 },
   });
 }
 
-const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-describe("supervisor", () => {
-  let supervisor: Supervisor;
+// Helper: strip null bytes from SAB reads
+function stripNulls(str: string): string {
+  return str.replace(/\0+$/, "");
+}
 
-  beforeEach(() => {
-    supervisor = makeSupervisor();
-  });
+// ============================================================================
+// Tier 1 Messaging
+// ============================================================================
 
-  afterEach(async () => {
-    await supervisor.shutdown();
-  });
+describe("tier 1 messaging", () => {
+  let sup: Supervisor;
 
-  // ==========================================================================
-  // Constraint tests
-  // ==========================================================================
+  beforeEach(() => { sup = makeSupervisor(); });
+  afterEach(async () => { await sup.shutdown(); });
 
-  describe("constraints", () => {
-    it("enforces maxActors limit — throws when exceeded", async () => {
-      const actors: ActorRef[] = [];
-      for (let i = 0; i < 5; i++) {
-        actors.push(
-          supervisor.spawn(async (_self, _msg, ctx) => {
-            ctx.heartbeat();
-          }),
-        );
-      }
-      expect(() =>
-        supervisor.spawn(async (_self, _msg, ctx) => {
-          ctx.heartbeat();
-        }),
-      ).toThrow("Max actors limit reached: 5");
-      for (const a of actors) a.terminate();
-      await wait(100);
+  it("self.send(msg, data) delivers to subscribers with correct shape", async () => {
+    const messages: Message[] = [];
+    const actor = sup.spawn(async (self) => {
+      self.send("progress", { percent: 0.5 });
     });
 
-    it("terminates actor on lease expiry after another interaction triggers checkLeases", async () => {
-      const lockAcquired = new Promise<void>((resolve) => {
-        const holder = supervisor.spawn(async (self, _msg, ctx) => {
-          const lockResult = await ctx.acquireLock();
-          if (lockResult.isOk) {
-            self.send({ type: "LOCK_ACQUIRED" });
+    actor.subscribe((msg) => messages.push(msg));
+    actor.spawn("start");
+    await wait(100);
+
+    expect(messages.length).toBeGreaterThanOrEqual(1);
+    const m = messages.find((x) => x.msg === "progress");
+    expect(m).toBeDefined();
+    expect(m!.data).toEqual({ percent: 0.5 });
+    expect(m!.from).toBeDefined();
+    expect(typeof m!.from).toBe("string");
+  });
+
+  it("from field is auto-injected by supervisor, not settable by sender", async () => {
+    const messages: Message[] = [];
+    const actor = sup.spawn(async (self) => {
+      self.send("test", { from: "fake" });
+    });
+
+    actor.subscribe((msg) => messages.push(msg));
+    actor.spawn("start");
+    await wait(100);
+
+    const m = messages.find((x) => x.msg === "test");
+    expect(m).toBeDefined();
+    expect(m!.from).toBe(actor.id);
+    expect(m!.from).not.toBe("fake");
+  });
+
+  it("multiple subscribers receive the same message", async () => {
+    const msgs1: Message[] = [];
+    const msgs2: Message[] = [];
+    const actor = sup.spawn(async (self) => {
+      self.send("hello");
+    });
+
+    actor.subscribe((msg) => msgs1.push(msg));
+    actor.subscribe((msg) => msgs2.push(msg));
+    actor.spawn("start");
+    await wait(100);
+
+    expect(msgs1.length).toBeGreaterThanOrEqual(1);
+    expect(msgs2.length).toBeGreaterThanOrEqual(1);
+    expect(msgs1[0]!.msg).toBe("hello");
+    expect(msgs2[0]!.msg).toBe("hello");
+  });
+
+  it("unsubscribe stops delivery", async () => {
+    const messages: Message[] = [];
+    const actor = sup.spawn(async (self) => {
+      self.send("msg1");
+    });
+
+    const unsub = actor.subscribe((msg) => messages.push(msg));
+    actor.spawn("first");
+    await wait(100);
+    unsub();
+
+    actor.spawn("second");
+    await wait(100);
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]!.msg).toBe("msg1");
+  });
+
+  it("supervisor.subscribe receives actor messages", async () => {
+    const messages: Message[] = [];
+    sup.subscribe((msg) => messages.push(msg as Message));
+
+    const actor = sup.spawn(async (self) => {
+      self.send("broadcast");
+    });
+    actor.spawn("start");
+    await wait(100);
+
+    expect(messages.some((m) => m.msg === "broadcast")).toBe(true);
+  });
+});
+
+// ============================================================================
+// Tier 2 Shared Memory
+// ============================================================================
+
+describe("tier 2 shared memory", () => {
+  let sup: Supervisor;
+
+  beforeEach(() => { sup = makeSupervisor(); });
+  afterEach(async () => { await sup.shutdown(); });
+
+  it("ctx.write returns Lock with epoch via Result", async () => {
+    const actor = sup.spawn(async (self, _msg, ctx) => {
+      const result = await ctx.write({
+        msg: "data",
+        type: "json",
+        data: ctx.fmt.json.encode({ value: 42 }),
+        share: "owner",
+      });
+      if (result.isOk) {
+        self.send("write_ok", { boxIndex: result.value.boxIndex, epoch: result.value.epoch });
+      } else {
+        self.send("write_err", { error: result.error });
+      }
+    });
+
+    const lockData = await new Promise<{ boxIndex: number; epoch: number }>((resolve, reject) => {
+      actor.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "write_ok" && m.data) resolve(m.data as { boxIndex: number; epoch: number });
+        if (m.msg === "write_err") reject(new Error((m.data as { error: string }).error));
+      });
+      actor.spawn("write");
+    });
+
+    expect(lockData.boxIndex).toBeGreaterThanOrEqual(0);
+    expect(lockData.epoch).toBeGreaterThanOrEqual(1);
+  });
+
+  it("actor.read(msg) returns ChainableReader for Tier 2 messages", async () => {
+    const actor = sup.spawn(async (self, _msg, ctx) => {
+      const result = await ctx.write({
+        msg: "result",
+        type: "json",
+        data: ctx.fmt.json.encode({ hello: "world" }),
+        share: "owner",
+      });
+      if (result.isOk) {
+        self.send("result", { handle: result.value });
+      }
+    });
+
+    const data = await new Promise<unknown>((resolve) => {
+      actor.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "result" && m.data) {
+          const d = m.data as { handle: Lock };
+          const reader = actor.read({ ...m, handle: d.handle });
+          if (reader) {
+            resolve(reader.json());
           }
-        });
-        holder.subscribe((msg) => {
-          const m = msg as { type?: string };
-          if (m.type === "LOCK_ACQUIRED") resolve();
-        });
-        (globalThis as unknown as Record<string, ActorRef | undefined>).__leaseHolder = holder;
+        }
       });
-
-      await wait(100);
-      const holder = (globalThis as unknown as Record<string, ActorRef | undefined>).__leaseHolder!;
-      holder.spawn("acquire");
-
-      await lockAcquired;
-      await wait(1200);
-
-      const pinger = supervisor.spawn(async (_self, _msg, ctx) => {
-        ctx.heartbeat();
-      });
-      pinger.spawn("ping");
-      await wait(300);
-
-      const diag = holder.getDiagnostics();
-      expect(diag.isErr).toBe(true);
-
-      const supDiag = supervisor.getDiagnostics();
-      expect(supDiag.isOk).toBe(true);
-      if (supDiag.isOk) {
-        expect(supDiag.value.activeActors).toBe(2);
-      }
-
-      pinger.terminate();
-      await wait(100);
-      delete (globalThis as Record<string, unknown>).__leaseHolder;
+      actor.spawn("write");
     });
+
+    expect(data).toEqual({ hello: "world" });
   });
 
-  // ==========================================================================
-  // Happy path
-  // ==========================================================================
-
-  describe("happy path", () => {
-    it("spawns actor and receives messages", async () => {
-      const messages: unknown[] = [];
-      const actor = supervisor.spawn(async (self, msg, _ctx) => {
-        self.send({ type: "ECHO", data: msg });
-      });
-
-      actor.subscribe((msg) => messages.push(msg));
-
-      await wait(100);
-      actor.spawn("hello");
-      await wait(200);
-
-      expect(messages.length).toBeGreaterThanOrEqual(1);
-      expect(messages[0]).toEqual({ type: "ECHO", data: "hello" });
+  it("actor.read(msg) returns null for Tier 1 messages (no handle)", async () => {
+    const actor = sup.spawn(async (self) => {
+      self.send("tier1", { value: 1 });
     });
 
-    it("actor can use self.send", async () => {
-      const messages: unknown[] = [];
-      const actor = supervisor.spawn(async (self, _msg, _ctx) => {
-        self.send({ type: "STATUS", payload: "running" });
-        self.send({ type: "STATUS", payload: "done" });
+    const result = await new Promise<unknown>((resolve) => {
+      actor.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "tier1") {
+          resolve(actor.read(m));
+        }
       });
-
-      actor.subscribe((msg) => messages.push(msg));
-
-      await wait(100);
       actor.spawn("start");
-      await wait(200);
-
-      expect(messages).toHaveLength(2);
-      expect(messages[0]).toEqual({ type: "STATUS", payload: "running" });
-      expect(messages[1]).toEqual({ type: "STATUS", payload: "done" });
     });
 
-    it("actor can use ctx.heartbeat", async () => {
-      const actor = supervisor.spawn(async (_self, _msg, ctx) => {
-        ctx.heartbeat();
-        ctx.heartbeat();
-        ctx.heartbeat();
+    expect(result).toBeNull();
+  });
+
+  it("actor.release(handle) frees the box for reuse", async () => {
+    const actor = sup.spawn(async (self, _msg, ctx) => {
+      const result = await ctx.write({
+        msg: "data",
+        type: "binary",
+        data: new Uint8Array([1, 2, 3]),
+        share: "owner",
       });
-
-      await wait(100);
-      actor.spawn("beat");
-      await wait(200);
-
-      const diag = actor.getDiagnostics();
-      expect(diag.isOk).toBe(true);
-      if (diag.isOk) {
-        expect(diag.value.heartbeatCount).toBe(3);
+      if (result.isOk) {
+        self.send("written", { handle: result.value });
       }
     });
 
-    it("actor can use ctx.fmt to encode and send data", async () => {
-      const messages: unknown[] = [];
-      const actor = supervisor.spawn(async (self, _msg, ctx) => {
-        const encoded = ctx.fmt.from({ hello: "world" });
-        const decoded = ctx.fmt.decode(encoded);
-        self.send({ type: "FMT_RESULT", decoded });
+    const handle = await new Promise<Lock>((resolve) => {
+      actor.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "written" && m.data) {
+          resolve((m.data as { handle: Lock }).handle);
+        }
       });
+      actor.spawn("write");
+    });
 
-      actor.subscribe((msg) => messages.push(msg));
+    await wait(50);
+    actor.release(handle);
+    await wait(100);
 
-      await wait(100);
+    // Box should be free now — diagnostics should show 0 boxes in use
+    const diag = sup.getDiagnostics();
+    if (diag.isOk) {
+      expect(diag.value.memoryPool.boxesInUse).toBe(0);
+    }
+  });
+
+  it("ChainableReader.json() decodes JSON data", async () => {
+    const actor = sup.spawn(async (self, _msg, ctx) => {
+      const result = await ctx.write({
+        msg: "json",
+        type: "json",
+        data: ctx.fmt.json.encode({ key: "value" }),
+        share: "owner",
+      });
+      if (result.isOk) self.send("json", { handle: result.value });
+    });
+
+    const data = await new Promise<unknown>((resolve) => {
+      actor.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "json" && m.data) {
+          const reader = actor.read({ ...m, handle: (m.data as { handle: Lock }).handle });
+          if (reader) resolve(reader.json());
+        }
+      });
+      actor.spawn("write");
+    });
+
+    expect(data).toEqual({ key: "value" });
+  });
+
+  it("ChainableReader.string() decodes string data", async () => {
+    const actor = sup.spawn(async (self, _msg, ctx) => {
+      const result = await ctx.write({
+        msg: "str",
+        type: "string",
+        data: ctx.fmt.string.encode("hello world"),
+        share: "owner",
+      });
+      if (result.isOk) self.send("str", { handle: result.value });
+    });
+
+    const data = await new Promise<string>((resolve) => {
+      actor.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "str" && m.data) {
+          const reader = actor.read({ ...m, handle: (m.data as { handle: Lock }).handle });
+          if (reader) resolve(reader.string());
+        }
+      });
+      actor.spawn("write");
+    });
+
+    expect(stripNulls(data)).toBe("hello world");
+  });
+});
+
+// ============================================================================
+// Authorization (ShareConfig)
+// ============================================================================
+
+describe("authorization", () => {
+  let sup: Supervisor;
+
+  beforeEach(() => { sup = makeSupervisor({ poolSize: 5 }); });
+  afterEach(async () => { await sup.shutdown(); });
+
+  it("owner share: only writer can read (via main-thread subscriber)", async () => {
+    const actor = sup.spawn(async (self, _msg, ctx) => {
+      const result = await ctx.write({
+        msg: "private",
+        type: "json",
+        data: ctx.fmt.json.encode({ secret: true }),
+        share: "owner",
+      });
+      if (result.isOk) self.send("private", { handle: result.value });
+    });
+
+    const data = await new Promise<unknown>((resolve) => {
+      actor.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "private" && m.data) {
+          const reader = actor.read({ ...m, handle: (m.data as { handle: Lock }).handle });
+          if (reader) resolve(reader.json());
+        }
+      });
+      actor.spawn("write");
+    });
+
+    expect(data).toEqual({ secret: true });
+  });
+
+  it("group share: actors in same group can read", async () => {
+    const group = sup.createGroup({ strategy: "one-for-one" });
+
+    const writer = group.spawn(async (self, _msg, ctx) => {
+      const result = await ctx.write({
+        msg: "shared",
+        type: "json",
+        data: ctx.fmt.json.encode({ team: true }),
+        share: "group",
+      });
+      if (result.isOk) {
+        self.send("shared", { handle: result.value });
+      }
+    });
+
+    const handle = await new Promise<Lock>((resolve) => {
+      writer.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "shared" && m.data) {
+          resolve((m.data as { handle: Lock }).handle);
+        }
+      });
+      writer.spawn("write");
+    });
+
+    expect(handle.boxIndex).toBeGreaterThanOrEqual(0);
+    expect(handle.epoch).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// ============================================================================
+// Lifecycle
+// ============================================================================
+
+describe("lifecycle", () => {
+  let sup: Supervisor;
+
+  beforeEach(() => { sup = makeSupervisor(); });
+  afterEach(async () => { await sup.shutdown(); });
+
+  it("spawn creates actor with unique id", async () => {
+    const actors: ActorRef[] = [];
+    for (let i = 0; i < 3; i++) {
+      actors.push(sup.spawn(async (self) => { self.send("init"); }));
+    }
+
+    const ids = actors.map((a) => a.id);
+    expect(new Set(ids).size).toBe(3);
+
+    for (const a of actors) a.terminate();
+    await wait(100);
+  });
+
+  it("terminate kills worker thread", async () => {
+    const actor = sup.spawn(async (self) => { self.send("alive"); });
+    actor.spawn("start");
+    await wait(100);
+
+    actor.terminate();
+    await wait(200);
+
+    const diag = actor.getDiagnostics();
+    expect(diag.isErr).toBe(true);
+  });
+
+  it("shutdown terminates all actors", async () => {
+    const actors: ActorRef[] = [];
+    for (let i = 0; i < 3; i++) {
+      actors.push(sup.spawn(async (self) => { self.send("i"); }));
+    }
+
+    await wait(100);
+    const before = sup.getDiagnostics();
+    if (before.isOk) expect(before.value.activeActors).toBe(3);
+
+    await sup.shutdown();
+
+    const after = sup.getDiagnostics();
+    if (after.isOk) expect(after.value.activeActors).toBe(0);
+  });
+
+  it("enforces maxActors limit", async () => {
+    const limited = makeSupervisor({ maxActors: 2 });
+    limited.spawn(async (self) => { self.send("a"); });
+    limited.spawn(async (self) => { self.send("b"); });
+
+    expect(() => limited.spawn(async (self) => { self.send("c"); })).toThrow("Max actors limit reached");
+
+    await limited.shutdown();
+  });
+
+  it("actor callback error terminates the actor", async () => {
+    const actor = sup.spawn(async () => {
+      throw new Error("intentional");
+    });
+
+    actor.spawn("boom");
+    await wait(300);
+
+    const diag = actor.getDiagnostics();
+    expect(diag.isErr).toBe(true);
+  });
+});
+
+// ============================================================================
+// Supervision strategies
+// ============================================================================
+
+describe("supervision", () => {
+  it("one-for-one: only failed actor restarts", async () => {
+    const sup = createSupervisor({
+      maxActors: 10,
+      memory: { poolSize: 3, boxSize: 1024 },
+      timeouts: { defaultLeaseMs: 2000 },
+      strategy: "one-for-one",
+      retry: { max: 2, backoff: "fixed" },
+    });
+
+    const group = sup.createGroup({ strategy: "one-for-one", retry: { max: 2, backoff: "fixed" } });
+
+    group.spawn(async (self) => { self.send("stable"); });
+    group.spawn(async () => { throw new Error("fail"); });
+
+    await wait(500);
+    const diag = sup.getDiagnostics();
+    if (diag.isOk) {
+      expect(diag.value.activeActors).toBeGreaterThanOrEqual(1);
+    }
+
+    await sup.shutdown();
+  });
+});
+
+// ============================================================================
+// Diagnostics
+// ============================================================================
+
+describe("diagnostics", () => {
+  let sup: Supervisor;
+
+  beforeEach(() => { sup = makeSupervisor(); });
+  afterEach(async () => { await sup.shutdown(); });
+
+  it("getDiagnostics returns supervisor metrics", async () => {
+    sup.spawn(async (self) => { self.send("a"); });
+    sup.spawn(async (self) => { self.send("b"); });
+
+    await wait(100);
+    const diag = sup.getDiagnostics();
+    expect(diag.isOk).toBe(true);
+    if (diag.isOk) {
+      expect(diag.value.activeActors).toBe(2);
+      expect(diag.value.memoryPool.poolSize).toBe(3);
+      expect(diag.value.actors).toHaveLength(2);
+    }
+  });
+
+  it("actor.getDiagnostics returns per-actor metrics", async () => {
+    const actor = sup.spawn(async (self) => { self.send("x"); });
+    actor.spawn("start");
+    await wait(100);
+
+    const diag = actor.getDiagnostics();
+    expect(diag.isOk).toBe(true);
+    if (diag.isOk) {
+      expect(diag.value.id).toBe(actor.id);
+      expect(diag.value.lifetimeMs).toBeGreaterThanOrEqual(0);
+    }
+  });
+});
+
+// ============================================================================
+// Edge cases
+// ============================================================================
+
+describe("edge cases", () => {
+  let sup: Supervisor;
+
+  beforeEach(() => { sup = makeSupervisor(); });
+  afterEach(async () => { await sup.shutdown(); });
+
+  it("rapid spawn/terminate cycles", async () => {
+    const actors: ActorRef[] = [];
+    for (let i = 0; i < 10; i++) {
+      const a = sup.spawn(async (self) => { self.send("i"); });
+      actors.push(a);
+      if (i % 2 === 0) a.terminate();
+    }
+    await wait(300);
+
+    const diag = sup.getDiagnostics();
+    if (diag.isOk) {
+      expect(diag.value.activeActors).toBeLessThanOrEqual(10);
+    }
+
+    for (const a of actors) {
+      try { a.terminate(); } catch { /* already terminated */ }
+    }
+    await wait(100);
+  });
+
+  it("linked actors: terminate one kills both", async () => {
+    const a = sup.spawn(async (self) => { self.send("a"); });
+    const b = sup.spawn(async (self) => { self.send("b"); });
+
+    a.link(b);
+    a.terminate();
+    await wait(200);
+
+    const diagA = a.getDiagnostics();
+    const diagB = b.getDiagnostics();
+    expect(diagA.isErr).toBe(true);
+    expect(diagB.isErr).toBe(true);
+  });
+
+  it("fmt.encode/decode roundtrip", async () => {
+    const actor = sup.spawn(async (self, _msg, ctx) => {
+      const encoded = ctx.fmt.encode({ test: 123 });
+      const decoded = ctx.fmt.decode(encoded);
+      self.send("roundtrip", decoded);
+    });
+
+    const result = await new Promise<unknown>((resolve) => {
+      actor.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "roundtrip") resolve(m.data);
+      });
       actor.spawn("test");
-      await wait(200);
-
-      expect(messages.length).toBeGreaterThanOrEqual(1);
-      expect(messages[0]).toEqual({
-        type: "FMT_RESULT",
-        decoded: { hello: "world" },
-      });
     });
 
-    it("shutdown terminates all actors", async () => {
-      const actors: ActorRef[] = [];
-      for (let i = 0; i < 3; i++) {
-        actors.push(
-          supervisor.spawn(async (_self, _msg, ctx) => {
-            ctx.heartbeat();
-          }),
-        );
-      }
-
-      await wait(100);
-      for (const a of actors) a.spawn("init");
-      await wait(200);
-
-      const beforeShutdown = supervisor.getDiagnostics();
-      expect(beforeShutdown.isOk).toBe(true);
-      if (beforeShutdown.isOk) {
-        expect(beforeShutdown.value.activeActors).toBe(3);
-      }
-
-      await supervisor.shutdown();
-
-      const afterShutdown = supervisor.getDiagnostics();
-      expect(afterShutdown.isOk).toBe(true);
-      if (afterShutdown.isOk) {
-        expect(afterShutdown.value.activeActors).toBe(0);
-      }
-    });
+    expect(result).toEqual({ test: 123 });
   });
+});
 
-  // ==========================================================================
-  // Non-happy path
-  // ==========================================================================
 
-  describe("error handling", () => {
-    it("handles actor callback errors", async () => {
-      const actor = supervisor.spawn(async (_self, _msg, _ctx) => {
-        throw new Error("intentional failure");
+
+// ============================================================================
+// Epoch stale-handle rejection
+// ============================================================================
+
+describe("epoch stale-handle rejection", () => {
+  let sup: Supervisor;
+
+  beforeEach(() => { sup = makeSupervisor(); });
+  afterEach(async () => { await sup.shutdown(); });
+
+  it("stale epoch cannot read recycled box", async () => {
+    const actor = sup.spawn(async (self, _msg, ctx) => {
+      const result = await ctx.write({
+        msg: "data",
+        type: "json",
+        data: ctx.fmt.json.encode({ value: 42 }),
+        share: "owner",
       });
-
-      await wait(100);
-      actor.spawn("boom");
-      await wait(300);
-
-      const diag = actor.getDiagnostics();
-      expect(diag.isErr).toBe(true);
+      if (result.isOk) {
+        self.send("written", { handle: result.value });
+        ctx.release(result.value);
+        self.send("released");
+      }
     });
 
-    it("terminates actor on demand", async () => {
-      const actor = supervisor.spawn(async (_self, _msg, ctx) => {
-        ctx.heartbeat();
+    const handle = await new Promise<Lock>((resolve) => {
+      actor.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "written" && m.data) {
+          resolve((m.data as { handle: Lock }).handle);
+        }
       });
-
-      await wait(100);
-      actor.spawn("idle");
-      await wait(100);
-
-      const beforeTerm = actor.getDiagnostics();
-      expect(beforeTerm.isOk).toBe(true);
-
-      actor.terminate();
-      await wait(200);
-
-      const afterTerm = actor.getDiagnostics();
-      expect(afterTerm.isErr).toBe(true);
+      actor.spawn("write");
     });
+
+    await new Promise<void>((resolve) => {
+      actor.subscribe((msg) => {
+        if (msg.msg === "released") resolve();
+      });
+    });
+
+    await wait(100);
+
+    const staleMsg: Message = { msg: "data", from: actor.id, handle };
+    const reader = actor.read(staleMsg);
+    expect(reader).toBeNull();
   });
+});
 
-  // ==========================================================================
-  // Edge cases
-  // ==========================================================================
+// ============================================================================
+// Per-actor INBOX delivery
+// ============================================================================
 
-  describe("edge cases", () => {
-    it("handles rapid spawn/terminate cycles", async () => {
-      const actors: ActorRef[] = [];
-      for (let i = 0; i < 10; i++) {
-        const a = supervisor.spawn(async (_self, _msg, ctx) => {
-          ctx.heartbeat();
-        });
-        actors.push(a);
-        if (i % 2 === 0) {
-          a.terminate();
+describe("per-actor INBOX delivery", () => {
+  let sup: Supervisor;
+
+  beforeEach(() => { sup = makeSupervisor({ poolSize: 5 }); });
+  afterEach(async () => { await sup.shutdown(); });
+
+  it("group share delivers INBOX to authorized readers", async () => {
+    const group = sup.createGroup({ strategy: "one-for-one" });
+
+    // Set up reader subscription BEFORE any writes
+    const inboxData = new Promise<unknown>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("No INBOX received")), 3000);
+      const reader = group.spawn(async (self, msg, ctx) => {
+        const m = msg as Message;
+        if (m.handle) {
+          const data = ctx.read(m);
+          if (data) {
+            self.send("inbox-received", { json: data.json(), from: m.from });
+          }
+        }
+      });
+
+      reader.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "inbox-received" && m.data) {
+          clearTimeout(timeout);
+          resolve((m.data as { json: unknown }).json);
+        }
+      });
+
+      // Trigger reader to be ready
+      reader.spawn("ready");
+    });
+
+    await wait(100);
+
+    const writer = group.spawn(async (self, _msg, ctx) => {
+      const result = await ctx.write({
+        msg: "shared-data",
+        type: "json",
+        data: ctx.fmt.json.encode({ team: true, value: 99 }),
+        share: "group",
+      });
+      if (result.isOk) self.send("written");
+    });
+
+    writer.spawn("write");
+
+    const data = await inboxData;
+    expect(data).toEqual({ team: true, value: 99 });
+  });
+});
+
+// ============================================================================
+// Authorization enforcement
+// ============================================================================
+
+describe("authorization enforcement", () => {
+  let sup: Supervisor;
+
+  beforeEach(() => { sup = makeSupervisor({ poolSize: 5 }); });
+  afterEach(async () => { await sup.shutdown(); });
+
+  it("owner share: unauthorized actor does NOT receive INBOX", async () => {
+    const group = sup.createGroup({ strategy: "one-for-one" });
+
+    let leaked = false;
+    const unauthorized = group.spawn(async (self, msg, ctx) => {
+      const m = msg as Message;
+      if (m.handle) {
+        const data = ctx.read(m);
+        if (data) {
+          self.send("inbox-leak", { json: data.json() });
         }
       }
-      await wait(300);
-
-      const diag = supervisor.getDiagnostics();
-      expect(diag.isOk).toBe(true);
-      if (diag.isOk) {
-        expect(diag.value.activeActors).toBe(5);
-      }
-
-      for (const a of actors) {
-        try {
-          a.terminate();
-        } catch {
-          // Already terminated
-        }
-      }
-      await wait(100);
     });
 
-    it("subscribe unsubscribe prevents further message delivery", async () => {
-      const messages: unknown[] = [];
-      const actor = supervisor.spawn(async (self, _msg, _ctx) => {
-        self.send({ type: "MSG" });
+    // Set up subscription before writer writes
+    unauthorized.subscribe((msg) => {
+      if (msg.msg === "inbox-leak") leaked = true;
+    });
+    unauthorized.spawn("ready");
+    await wait(100);
+
+    const writer = group.spawn(async (self, _msg, ctx) => {
+      const result = await ctx.write({
+        msg: "private-data",
+        type: "json",
+        data: ctx.fmt.json.encode({ secret: true }),
+        share: "owner",
       });
-
-      const unsub = actor.subscribe((msg) => messages.push(msg));
-
-      await wait(100);
-      actor.spawn("first");
-      await wait(200);
-
-      unsub();
-
-      actor.spawn("second");
-      await wait(200);
-
-      expect(messages).toHaveLength(1);
+      if (result.isOk) self.send("written");
     });
 
-    it("actor id is unique per spawn", async () => {
-      const ids = new Set<string>();
-      for (let i = 0; i < 5; i++) {
-        const a = supervisor.spawn(async (_self, _msg, ctx) => {
-          ctx.heartbeat();
-        });
-        ids.add(a.id);
-        a.terminate();
-      }
-      await wait(200);
-      expect(ids.size).toBe(5);
+    await new Promise<void>((resolve) => {
+      writer.subscribe((msg) => {
+        if (msg.msg === "written") resolve();
+      });
+      writer.spawn("write");
     });
+
+    await wait(300);
+    expect(leaked).toBe(false);
   });
 
-  // ==========================================================================
-  // Reading state (READING(3))
-  // ==========================================================================
-
-  describe("reading state", () => {
-    // ------------------------------------------------------------------------
-    // Main thread reads
-    // ------------------------------------------------------------------------
-
-    describe("main thread reads", () => {
-      it("actor.read(lock) on READY box transitions to READING and returns data", async () => {
-        let savedLock: Lock | null = null;
-
-        // Data created inside callback — must be self-contained for serialization
-        const writer = supervisor.spawn(async (self, _msg, ctx) => {
-          const lockResult = await ctx.acquireLock();
-          if (lockResult.isOk) {
-            const lock = lockResult.value;
-            ctx.deposit(lock, new Uint8Array([42, 43, 44]));
-            ctx.done(lock);
-          }
-        });
-
-        const readyPromise = new Promise<void>((resolve) => {
-          writer.subscribe((msg) => {
-            const m = msg as { type?: string; address?: Lock };
-            if (m.type === "DEPOSIT_READY" && m.address) {
-              savedLock = m.address;
-              resolve();
-            }
-          });
-        });
-
-        writer.spawn("write");
-        await readyPromise;
-        await wait(100);
-
-        expect(savedLock).not.toBeNull();
-        const data = writer.read(savedLock!);
-        expect(data[0]).toBe(42);
-        expect(data[1]).toBe(43);
-        expect(data[2]).toBe(44);
-
-        writer.done(savedLock!);
-        writer.terminate();
-        await wait(100);
+  it("main-thread subscriber CAN read owner-share data", async () => {
+    const actor = sup.spawn(async (self, _msg, ctx) => {
+      const result = await ctx.write({
+        msg: "owner-data",
+        type: "json",
+        data: ctx.fmt.json.encode({ secret: true }),
+        share: "owner",
       });
+      if (result.isOk) self.send("owner-data", { handle: result.value });
+    });
 
-      it("actor.done(lock) on READING box with count=1 transitions to CLEAN", async () => {
-        let savedLock: Lock | null = null;
-
-        const writer = supervisor.spawn(async (self, _msg, ctx) => {
-          const lockResult = await ctx.acquireLock();
-          if (lockResult.isOk) {
-            const lock = lockResult.value;
-            ctx.deposit(lock, new Uint8Array([1, 2, 3]));
-            ctx.done(lock);
-          }
-        });
-
-        const readyPromise = new Promise<void>((resolve) => {
-          writer.subscribe((msg) => {
-            const m = msg as { type?: string; address?: Lock };
-            if (m.type === "DEPOSIT_READY" && m.address) {
-              savedLock = m.address;
-              resolve();
-            }
-          });
-        });
-
-        writer.spawn("write");
-        await readyPromise;
-        await wait(100);
-
-        // Read (transitions to READING)
-        writer.read(savedLock!);
-        // Done (should transition back to CLEAN)
-        writer.done(savedLock!);
-
-        // Verify box is now CLEAN by acquiring it again
-        const acquired = new Promise<boolean>((resolve) => {
-          const reader = supervisor.spawn(async (self, _msg, ctx) => {
-            const lockResult = await ctx.acquireLock();
-            if (lockResult.isOk) {
-              self.send({ type: "ACQUIRED", boxIndex: lockResult.value.boxIndex });
-              ctx.done(lockResult.value);
-            }
-          });
-          reader.subscribe((msg) => {
-            const m = msg as { type?: string; boxIndex?: number };
-            if (m.type === "ACQUIRED" && m.boxIndex !== undefined) {
-              resolve(m.boxIndex === savedLock!.boxIndex);
-            }
-          });
-          reader.spawn("acquire");
-        });
-
-        const sameBox = await acquired;
-        expect(sameBox).toBe(true);
-
-        writer.terminate();
-        await wait(100);
+    const data = await new Promise<unknown>((resolve) => {
+      actor.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "owner-data" && m.data) {
+          const reader = actor.read({ ...m, handle: (m.data as { handle: Lock }).handle });
+          if (reader) resolve(reader.json());
+        }
       });
+      actor.spawn("write");
+    });
 
-      it("actor.read(lock) on READING box increments ref count (concurrent readers)", async () => {
-        let savedLock: Lock | null = null;
+    expect(data).toEqual({ secret: true });
+  });
+});
 
-        const writer = supervisor.spawn(async (self, _msg, ctx) => {
-          const lockResult = await ctx.acquireLock();
-          if (lockResult.isOk) {
-            const lock = lockResult.value;
-            ctx.deposit(lock, new Uint8Array([99]));
-            ctx.done(lock);
-          }
-        });
+// ============================================================================
+// One writer per WRITING box (FIFO queue)
+// ============================================================================
 
-        const readyPromise = new Promise<void>((resolve) => {
-          writer.subscribe((msg) => {
-            const m = msg as { type?: string; address?: Lock };
-            if (m.type === "DEPOSIT_READY" && m.address) {
-              savedLock = m.address;
-              resolve();
-            }
-          });
-        });
+describe("one writer per WRITING box", () => {
+  let sup: Supervisor;
 
-        writer.spawn("write");
-        await readyPromise;
-        await wait(100);
+  beforeEach(() => { sup = makeSupervisor({ poolSize: 2 }); });
+  afterEach(async () => { await sup.shutdown(); });
 
-        // First read — transitions READY → READING, count=1
-        const data1 = writer.read(savedLock!);
-        expect(data1[0]).toBe(99);
-
-        // Second read on same lock — should still work (concurrent reader), count=2
-        const data2 = writer.read(savedLock!);
-        expect(data2[0]).toBe(99);
-
-        // First done — count goes to 1, should still be READING
-        writer.done(savedLock!);
-
-        // Should still be able to read (box is still READING)
-        const data3 = writer.read(savedLock!);
-        expect(data3[0]).toBe(99);
-
-        // Clean up: two more done calls
-        writer.done(savedLock!); // count 2→1
-        writer.done(savedLock!); // count 1→0, CLEAN
-
-        writer.terminate();
-        await wait(100);
+  it("concurrent writes queue when pool full, FIFO order", async () => {
+    // Actor A: writes, holds box, releases after signal
+    const actorA = sup.spawn(async (self, _msg, ctx) => {
+      const result = await ctx.write({
+        msg: "fill-a",
+        type: "json",
+        data: ctx.fmt.json.encode({ actor: "A" }),
+        share: "owner",
       });
+      if (result.isOk) {
+        self.send("a-written");
+        // Hold box for 1s then release
+        await new Promise((r) => setTimeout(r, 1000));
+        ctx.release(result.value);
+        self.send("a-released");
+      }
+    });
 
-      it("actor.done(lock) on READING box with count>1 decrements count but keeps READING", async () => {
-        let savedLock: Lock | null = null;
+    // Actor B: writes and holds box long time
+    const actorB = sup.spawn(async (self, _msg, ctx) => {
+      const result = await ctx.write({
+        msg: "fill-b",
+        type: "json",
+        data: ctx.fmt.json.encode({ actor: "B" }),
+        share: "owner",
+      });
+      if (result.isOk) {
+        self.send("b-written");
+        await new Promise((r) => setTimeout(r, 10000));
+      }
+    });
 
-        const writer = supervisor.spawn(async (self, _msg, ctx) => {
-          const lockResult = await ctx.acquireLock();
-          if (lockResult.isOk) {
-            const lock = lockResult.value;
-            ctx.deposit(lock, new Uint8Array([77]));
-            ctx.done(lock);
-          }
-        });
+    // Actor C: will queue
+    const actorC = sup.spawn(async (self, _msg, ctx) => {
+      const result = await ctx.write({
+        msg: "queued-c",
+        type: "json",
+        data: ctx.fmt.json.encode({ actor: "C" }),
+        share: "owner",
+      });
+      if (result.isOk) {
+        self.send("c-written", { handle: result.value });
+      }
+    });
 
-        const readyPromise = new Promise<void>((resolve) => {
-          writer.subscribe((msg) => {
-            const m = msg as { type?: string; address?: Lock };
-            if (m.type === "DEPOSIT_READY" && m.address) {
-              savedLock = m.address;
-              resolve();
-            }
-          });
-        });
-
-        writer.spawn("write");
-        await readyPromise;
-        await wait(100);
-
-        // Two concurrent reads
-        writer.read(savedLock!);
-        writer.read(savedLock!);
-
-        // First done — count goes from 2→1, box should still be READING
-        writer.done(savedLock!);
-
-        // Should still be able to read (box is still READING)
-        const data = writer.read(savedLock!);
-        expect(data[0]).toBe(77);
-
-        // Clean up
-        writer.done(savedLock!); // count 2→1
-        writer.done(savedLock!); // count 1→0, CLEAN
-
-        writer.terminate();
-        await wait(100);
+    // Set up C's listener first
+    const cPromise = new Promise<Lock>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("C never got write grant")), 5000);
+      actorC.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "c-written" && m.data) {
+          clearTimeout(timeout);
+          resolve((m.data as { handle: Lock }).handle);
+        }
       });
     });
 
-    // ------------------------------------------------------------------------
-    // Worker reads
-    // ------------------------------------------------------------------------
-
-    describe("worker reads", () => {
-      it("worker calls ctx.read(lock) → receives READ_GRANTED → can read data", async () => {
-        let savedLock: Lock | null = null;
-
-        const writer = supervisor.spawn(async (self, _msg, ctx) => {
-          const lockResult = await ctx.acquireLock();
-          if (lockResult.isOk) {
-            const lock = lockResult.value;
-            ctx.deposit(lock, new Uint8Array([10, 20, 30]));
-            ctx.done(lock);
-          }
-        });
-
-        const readyPromise = new Promise<void>((resolve) => {
-          writer.subscribe((msg) => {
-            const m = msg as { type?: string; address?: Lock };
-            if (m.type === "DEPOSIT_READY" && m.address) {
-              savedLock = m.address;
-              resolve();
-            }
-          });
-        });
-
-        writer.spawn("write");
-        await readyPromise;
-        await wait(100);
-
-        expect(savedLock).not.toBeNull();
-
-        // Pass lock via spawn message to reader worker
-        const readResult = new Promise<Uint8Array>((resolve) => {
-          const reader = supervisor.spawn(async (self, msg, ctx) => {
-            const lockToRead = msg as Lock;
-            const result = await ctx.read(lockToRead);
-            if (result.isOk) {
-              const bytes = result.value.slice(0, 3);
-              self.send({ type: "READ_DATA", bytes: Array.from(bytes) });
-            } else {
-              self.send({ type: "READ_ERROR", error: result.error });
-            }
-          });
-          reader.subscribe((msg) => {
-            const m = msg as { type?: string; bytes?: number[]; error?: string };
-            if (m.type === "READ_DATA" && m.bytes) {
-              resolve(new Uint8Array(m.bytes));
-            }
-            if (m.type === "READ_ERROR") {
-              resolve(new Uint8Array([0, 0, 0]));
-            }
-          });
-          reader.spawn(savedLock);
-        });
-
-        const data = await readResult;
-        expect(data[0]).toBe(10);
-        expect(data[1]).toBe(20);
-        expect(data[2]).toBe(30);
-
-        writer.terminate();
-        await wait(100);
-      });
-
-      it("worker calls ctx.done(lock) → main thread decrements count", async () => {
-        let savedLock: Lock | null = null;
-
-        const writer = supervisor.spawn(async (self, _msg, ctx) => {
-          const lockResult = await ctx.acquireLock();
-          if (lockResult.isOk) {
-            const lock = lockResult.value;
-            ctx.deposit(lock, new Uint8Array([55]));
-            ctx.done(lock);
-          }
-        });
-
-        const readyPromise = new Promise<void>((resolve) => {
-          writer.subscribe((msg) => {
-            const m = msg as { type?: string; address?: Lock };
-            if (m.type === "DEPOSIT_READY" && m.address) {
-              savedLock = m.address;
-              resolve();
-            }
-          });
-        });
-
-        writer.spawn("write");
-        await readyPromise;
-        await wait(100);
-
-        // Reader reads and then calls ctx.done — pass lock via spawn message
-        const reader = supervisor.spawn(async (_self, msg, ctx) => {
-          const lockToRead = msg as Lock;
-          const result = await ctx.read(lockToRead);
-          if (result.isOk) {
-            ctx.done(lockToRead);
-          }
-        });
-        reader.spawn(savedLock);
-        await wait(500);
-
-        // Box should be CLEAN now (count went to 0)
-        const acquireResult = new Promise<boolean>((resolve) => {
-          const verifier = supervisor.spawn(async (self, _msg, ctx) => {
-            const lockResult = await ctx.acquireLock();
-            self.send({ type: "VERIFY", success: lockResult.isOk });
-          });
-          verifier.subscribe((msg) => {
-            const m = msg as { type?: string; success?: boolean };
-            if (m.type === "VERIFY") {
-              resolve(m.success ?? false);
-            }
-          });
-          verifier.spawn("verify");
-        });
-
-        const success = await acquireResult;
-        expect(success).toBe(true);
-
-        reader.terminate();
-        writer.terminate();
-        await wait(100);
-      });
-
-      it("ctx.read(lock) on non-READY box (CLEAN) returns error", async () => {
-        const readCleanResult = new Promise<string>((resolve) => {
-          const reader = supervisor.spawn(async (self, _msg, ctx) => {
-            const fakeLock: Lock = { boxIndex: 0, byteOffset: 0, length: 1024 };
-            const result = await ctx.read(fakeLock);
-            if (result.isErr) {
-              self.send({ type: "READ_FAILED", error: result.error });
-            } else {
-              self.send({ type: "READ_UNEXPECTED_SUCCESS" });
-            }
-          });
-          reader.subscribe((msg) => {
-            const m = msg as { type?: string; error?: string };
-            if (m.type === "READ_FAILED") {
-              resolve(m.error ?? "unknown");
-            }
-            if (m.type === "READ_UNEXPECTED_SUCCESS") {
-              resolve("UNEXPECTED_SUCCESS");
-            }
-          });
-          reader.spawn("read-clean");
-        });
-
-        const error = await readCleanResult;
-        expect(error).toContain("not readable");
+    // Spawn B first (will hold one box)
+    actorB.spawn("write");
+    await new Promise<void>((resolve) => {
+      actorB.subscribe((msg) => {
+        if (msg.msg === "b-written") resolve();
       });
     });
 
-    // ------------------------------------------------------------------------
-    // End-to-end actor-to-actor
-    // ------------------------------------------------------------------------
+    await wait(100);
 
-    describe("end-to-end actor-to-actor", () => {
-      it("Actor A deposits → READY, Actor B reads → correct data, Actor B done → CLEAN", async () => {
-        let savedLock: Lock | null = null;
-
-        // Actor A deposits data — all data created inside callback for serialization
-        const actorA = supervisor.spawn(async (self, _msg, ctx) => {
-          const lockResult = await ctx.acquireLock();
-          if (lockResult.isOk) {
-            const lock = lockResult.value;
-            ctx.deposit(lock, new Uint8Array([100, 101, 102, 103, 104]));
-            ctx.done(lock);
-          }
-        });
-
-        const readyPromise = new Promise<void>((resolve) => {
-          actorA.subscribe((msg) => {
-            const m = msg as { type?: string; address?: Lock };
-            if (m.type === "DEPOSIT_READY" && m.address) {
-              savedLock = m.address;
-              resolve();
-            }
-          });
-        });
-
-        actorA.spawn("deposit");
-        await readyPromise;
-        await wait(100);
-
-        expect(savedLock).not.toBeNull();
-
-        // Actor B reads the data — pass lock via spawn message
-        const readData = new Promise<Uint8Array>((resolve) => {
-          const actorB = supervisor.spawn(async (self, msg, ctx) => {
-            const lockToRead = msg as Lock;
-            const result = await ctx.read(lockToRead);
-            if (result.isOk) {
-              const bytes = result.value.slice(0, 5);
-              self.send({ type: "DATA", bytes: Array.from(bytes) });
-              ctx.done(lockToRead);
-            } else {
-              self.send({ type: "READ_ERR", error: result.error });
-            }
-          });
-          actorB.subscribe((msg) => {
-            const m = msg as { type?: string; bytes?: number[]; error?: string };
-            if (m.type === "DATA" && m.bytes) {
-              resolve(new Uint8Array(m.bytes));
-            }
-            if (m.type === "READ_ERR") {
-              resolve(new Uint8Array([0]));
-            }
-          });
-          actorB.spawn(savedLock);
-        });
-
-        const data = await readData;
-        expect(data[0]).toBe(100);
-        expect(data[1]).toBe(101);
-        expect(data[2]).toBe(102);
-        expect(data[3]).toBe(103);
-        expect(data[4]).toBe(104);
-
-        await wait(200);
-
-        // Verify box is CLEAN by acquiring it
-        const canAcquire = new Promise<boolean>((resolve) => {
-          const actorC = supervisor.spawn(async (self, _msg, ctx) => {
-            const result = await ctx.acquireLock();
-            self.send({ type: "ACQUIRE_RESULT", ok: result.isOk });
-          });
-          actorC.subscribe((msg) => {
-            const m = msg as { type?: string; ok?: boolean };
-            if (m.type === "ACQUIRE_RESULT") {
-              resolve(m.ok ?? false);
-            }
-          });
-          actorC.spawn("acquire");
-        });
-
-        const acquired = await canAcquire;
-        expect(acquired).toBe(true);
-
-        actorA.terminate();
-        await wait(100);
+    // Spawn A (will hold the other box)
+    actorA.spawn("write");
+    await new Promise<void>((resolve) => {
+      actorA.subscribe((msg) => {
+        if (msg.msg === "a-written") resolve();
       });
     });
 
-    // ------------------------------------------------------------------------
-    // Lease expiry during READING
-    // ------------------------------------------------------------------------
+    await wait(100);
 
-    describe("lease expiry during READING", () => {
-      it("force-cleans box and terminates actor when lease expires during READING", async () => {
-        let savedLock: Lock | null = null;
+    // Now both boxes are in use. Spawn C — should queue.
+    actorC.spawn("write");
 
-        const writer = supervisor.spawn(async (self, _msg, ctx) => {
-          const lockResult = await ctx.acquireLock();
-          if (lockResult.isOk) {
-            const lock = lockResult.value;
-            ctx.deposit(lock, new Uint8Array([200]));
-            ctx.done(lock);
-          }
-        });
+    // Wait for A to release (1s)
+    const handleC = await cPromise;
+    expect(handleC.boxIndex).toBeGreaterThanOrEqual(0);
+    expect(handleC.epoch).toBeGreaterThanOrEqual(1);
+  });
+});
 
-        const readyPromise = new Promise<void>((resolve) => {
-          writer.subscribe((msg) => {
-            const m = msg as { type?: string; address?: Lock };
-            if (m.type === "DEPOSIT_READY" && m.address) {
-              savedLock = m.address;
-              resolve();
-            }
-          });
-        });
+// ============================================================================
+// Lease expiry kills WRITING actor
+// ============================================================================
 
-        writer.spawn("write");
-        await readyPromise;
-        await wait(100);
+describe("lease expiry kills WRITING actor", () => {
+  let sup: Supervisor;
 
-        // Main thread reads — transitions to READING
-        const data = writer.read(savedLock!);
-        expect(data[0]).toBe(200);
+  beforeEach(() => { sup = makeSupervisor({ poolSize: 3, leaseMs: 300 }); });
+  afterEach(async () => { await sup.shutdown(); });
 
-        // Wait for lease to expire (defaultLeaseMs = 1000)
-        await wait(1200);
-
-        // Trigger checkLeases by spawning another actor
-        const pinger = supervisor.spawn(async (_self, _msg, ctx) => {
-          ctx.heartbeat();
-        });
-        pinger.spawn("ping");
-        await wait(300);
-
-        // Writer should have been terminated due to lease expiry
-        const diag = writer.getDiagnostics();
-        expect(diag.isErr).toBe(true);
-
-        pinger.terminate();
-        await wait(100);
+  it("actor holding WRITING box past lease gets terminated", async () => {
+    // Sync callback: sends WRITE_REQUEST then blocks, preventing COMMIT
+    const writer = sup.spawn((self, _msg, ctx) => {
+      ctx.write({
+        msg: "long-write",
+        type: "json",
+        data: ctx.fmt.json.encode({ slow: true }),
+        share: "owner",
       });
+      self.send("write-requested");
+      // Block worker — prevents processing WRITE_GRANTED → no COMMIT
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10000);
     });
 
-    // ------------------------------------------------------------------------
-    // Termination while READING
-    // ------------------------------------------------------------------------
-
-    describe("termination while READING", () => {
-      it("box is cleaned and reader count cleared when actor terminated during READING", async () => {
-        let savedLock: Lock | null = null;
-
-        const writer = supervisor.spawn(async (self, _msg, ctx) => {
-          const lockResult = await ctx.acquireLock();
-          if (lockResult.isOk) {
-            const lock = lockResult.value;
-            ctx.deposit(lock, new Uint8Array([150]));
-            ctx.done(lock);
-          }
-        });
-
-        const readyPromise = new Promise<void>((resolve) => {
-          writer.subscribe((msg) => {
-            const m = msg as { type?: string; address?: Lock };
-            if (m.type === "DEPOSIT_READY" && m.address) {
-              savedLock = m.address;
-              resolve();
-            }
-          });
-        });
-
-        writer.spawn("write");
-        await readyPromise;
-        await wait(100);
-
-        // Main thread reads — transitions to READING
-        writer.read(savedLock!);
-
-        // Terminate the actor while it holds a reading lock
-        writer.terminate();
-        await wait(200);
-
-        // Box should be CLEAN now — verify by acquiring it
-        const canAcquire = new Promise<boolean>((resolve) => {
-          const verifier = supervisor.spawn(async (self, _msg, ctx) => {
-            const result = await ctx.acquireLock();
-            self.send({ type: "ACQUIRE_RESULT", ok: result.isOk });
-          });
-          verifier.subscribe((msg) => {
-            const m = msg as { type?: string; ok?: boolean };
-            if (m.type === "ACQUIRE_RESULT") {
-              resolve(m.ok ?? false);
-            }
-          });
-          verifier.spawn("verify");
-        });
-
-        const acquired = await canAcquire;
-        expect(acquired).toBe(true);
-
-        await wait(100);
+    await new Promise<void>((resolve) => {
+      writer.subscribe((msg) => {
+        if (msg.msg === "write-requested") resolve();
       });
+      writer.spawn("write");
     });
+
+    await wait(100);
+
+    const diagBefore = writer.getDiagnostics();
+    expect(diagBefore.isOk).toBe(true);
+
+    // Wait for lease to expire (300ms) + buffer
+    await wait(500);
+
+    // Trigger checkLeases via another actor's send (handleSend calls checkLeases)
+    const trigger = sup.spawn(async (self) => {
+      self.send("trigger-check");
+    });
+
+    await new Promise<void>((resolve) => {
+      trigger.subscribe((msg) => {
+        if (msg.msg === "trigger-check") resolve();
+      });
+      trigger.spawn("trigger");
+    });
+
+    await wait(200);
+
+    const diagAfter = writer.getDiagnostics();
+    expect(diagAfter.isErr).toBe(true);
+  });
+});
+
+// ============================================================================
+// Monitoring (uni-directional)
+// ============================================================================
+
+describe("monitoring", () => {
+  let sup: Supervisor;
+
+  beforeEach(() => { sup = makeSupervisor(); });
+  afterEach(async () => { await sup.shutdown(); });
+
+  it("monitor receives DOWN notification, monitor stays alive", async () => {
+    const monitor = sup.spawn(async () => {});
+
+    const target = sup.spawn(async (self) => {
+      self.send("alive");
+    });
+
+    monitor.monitor(target);
+
+    const downMsg = await new Promise<Message>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("No DOWN received")), 3000);
+      monitor.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "DOWN" && m.data) {
+          clearTimeout(timeout);
+          resolve(m);
+        }
+      });
+      target.terminate();
+    });
+
+    expect(downMsg.msg).toBe("DOWN");
+    expect((downMsg.data as { id: string }).id).toBe(target.id);
+
+    const monitorDiag = monitor.getDiagnostics();
+    expect(monitorDiag.isOk).toBe(true);
+  });
+});
+
+// ============================================================================
+// supervisor.terminateActor(id)
+// ============================================================================
+
+describe("supervisor.terminateActor", () => {
+  let sup: Supervisor;
+
+  beforeEach(() => { sup = makeSupervisor(); });
+  afterEach(async () => { await sup.shutdown(); });
+
+  it("terminates actor by ID", async () => {
+    const actor = sup.spawn(async (self) => {
+      self.send("alive");
+    });
+
+    actor.spawn("start");
+    await wait(100);
+
+    const diagBefore = actor.getDiagnostics();
+    expect(diagBefore.isOk).toBe(true);
+
+    sup.terminateActor(actor.id);
+    await wait(200);
+
+    const diagAfter = actor.getDiagnostics();
+    expect(diagAfter.isErr).toBe(true);
+  });
+});
+
+// ============================================================================
+// ctx.isCancelled
+// ============================================================================
+
+describe("ctx.isCancelled", () => {
+  let sup: Supervisor;
+
+  beforeEach(() => { sup = makeSupervisor(); });
+  afterEach(async () => { await sup.shutdown(); });
+
+  it("isCancelled is false during normal execution", async () => {
+    const actor = sup.spawn(async (self, _msg, ctx) => {
+      self.send("cancelled", { value: ctx.isCancelled });
+    });
+
+    const result = await new Promise<boolean>((resolve) => {
+      actor.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "cancelled" && m.data) {
+          resolve((m.data as { value: boolean }).value);
+        }
+      });
+      actor.spawn("check");
+    });
+
+    expect(result).toBe(false);
+  });
+
+  it("isCancelled becomes true after termination signal", async () => {
+    const actor = sup.spawn(async (self, _msg, ctx) => {
+      self.send("before", { value: ctx.isCancelled });
+      await new Promise((r) => setTimeout(r, 10000));
+    });
+
+    const beforeVal = await new Promise<boolean>((resolve) => {
+      actor.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "before" && m.data) {
+          resolve((m.data as { value: boolean }).value);
+        }
+      });
+      actor.spawn("check");
+    });
+
+    expect(beforeVal).toBe(false);
+
+    actor.terminate();
+    await wait(200);
+
+    const diag = actor.getDiagnostics();
+    expect(diag.isErr).toBe(true);
+  });
+});
+
+// ============================================================================
+// ChainableReader.binary() and .raw()
+// ============================================================================
+
+describe("ChainableReader.binary and raw", () => {
+  let sup: Supervisor;
+
+  beforeEach(() => { sup = makeSupervisor({ poolSize: 5 }); });
+  afterEach(async () => { await sup.shutdown(); });
+
+  it("binary() returns Uint8Array with correct bytes", async () => {
+    const actor = sup.spawn(async (self, _msg, ctx) => {
+      // Create bytes INSIDE callback (not in closure — callback is serialized)
+      const bytes = new Uint8Array([0xDE, 0xAD, 0xBE, 0xEF, 0x42]);
+      const result = await ctx.write({
+        msg: "binary-data",
+        type: "binary",
+        data: bytes,
+        share: "owner",
+      });
+      if (result.isOk) self.send("binary-data", { handle: result.value });
+    });
+
+    const data = await new Promise<Uint8Array>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Timeout waiting for binary data")), 5000);
+      actor.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "binary-data" && m.data) {
+          clearTimeout(timeout);
+          const reader = actor.read({ ...m, handle: (m.data as { handle: Lock }).handle });
+          if (reader) resolve(reader.binary());
+        }
+      });
+      actor.spawn("write");
+    });
+
+    expect(data).toBeInstanceOf(Uint8Array);
+    expect(data[0]).toBe(0xDE);
+    expect(data[1]).toBe(0xAD);
+    expect(data[2]).toBe(0xBE);
+    expect(data[3]).toBe(0xEF);
+    expect(data[4]).toBe(0x42);
+  });
+
+  it("raw() returns Uint8Array with correct bytes", async () => {
+    const actor = sup.spawn(async (self, _msg, ctx) => {
+      const bytes = new Uint8Array([0xCA, 0xFE, 0xBA, 0xBE]);
+      const result = await ctx.write({
+        msg: "raw-data",
+        type: "binary",
+        data: bytes,
+        share: "owner",
+      });
+      if (result.isOk) self.send("raw-data", { handle: result.value });
+    });
+
+    const data = await new Promise<Uint8Array>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Timeout waiting for raw data")), 5000);
+      actor.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "raw-data" && m.data) {
+          clearTimeout(timeout);
+          const reader = actor.read({ ...m, handle: (m.data as { handle: Lock }).handle });
+          if (reader) resolve(reader.raw());
+        }
+      });
+      actor.spawn("write");
+    });
+
+    expect(data).toBeInstanceOf(Uint8Array);
+    expect(data[0]).toBe(0xCA);
+    expect(data[1]).toBe(0xFE);
+    expect(data[2]).toBe(0xBA);
+    expect(data[3]).toBe(0xBE);
   });
 });

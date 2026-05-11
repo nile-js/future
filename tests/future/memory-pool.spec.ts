@@ -1,48 +1,39 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 import { parseBoxSize, createMemoryPool } from "../../src/future/memory-pool";
-import { BOX_CLEAN, BOX_LOCKED, BOX_READY, BOX_READING, type BoxState } from "../../src/future/types";
 
 // ============================================================================
 // parseBoxSize
 // ============================================================================
 
 describe("parseBoxSize", () => {
-  describe("numeric input", () => {
-    it("returns floored value for positive number", () => {
-      expect(parseBoxSize(1024)).toBe(1024);
-      expect(parseBoxSize(1024.7)).toBe(1024);
-    });
-
-    it("throws on zero, negative, Infinity, NaN", () => {
-      expect(() => parseBoxSize(0)).toThrow("Invalid box size");
-      expect(() => parseBoxSize(-100)).toThrow("Invalid box size");
-      expect(() => parseBoxSize(Infinity)).toThrow("Invalid box size");
-      expect(() => parseBoxSize(NaN)).toThrow("Invalid box size");
-    });
-  });
-
-  describe("string input with units", () => {
-    it("parses KB (case-insensitive)", () => {
+  describe("happy path", () => {
+    it("parses KB strings correctly", () => {
       expect(parseBoxSize("1KB")).toBe(1024);
       expect(parseBoxSize("2kb")).toBe(2048);
       expect(parseBoxSize("1KiB")).toBe(1024);
     });
 
-    it("parses MB (case-insensitive)", () => {
+    it("parses MB strings correctly", () => {
       expect(parseBoxSize("1MB")).toBe(1024 * 1024);
       expect(parseBoxSize("2mb")).toBe(2 * 1024 * 1024);
       expect(parseBoxSize("1MiB")).toBe(1024 * 1024);
     });
 
-    it("parses GB (case-insensitive)", () => {
+    it("parses GB strings correctly", () => {
       expect(parseBoxSize("1GB")).toBe(1024 * 1024 * 1024);
       expect(parseBoxSize("1GiB")).toBe(1024 * 1024 * 1024);
     });
 
-    it("parses bytes", () => {
+    it("parses byte strings correctly", () => {
       expect(parseBoxSize("64b")).toBe(64);
       expect(parseBoxSize("100byte")).toBe(100);
       expect(parseBoxSize("256bytes")).toBe(256);
+    });
+
+    it("parses numeric values", () => {
+      expect(parseBoxSize(1024)).toBe(1024);
+      expect(parseBoxSize(1024.7)).toBe(1024);
+      expect(parseBoxSize("512")).toBe(512);
     });
 
     it("handles decimal values and whitespace", () => {
@@ -50,20 +41,30 @@ describe("parseBoxSize", () => {
       expect(parseBoxSize("  1KB  ")).toBe(1024);
       expect(parseBoxSize("2 MB")).toBe(2 * 1024 * 1024);
     });
+  });
+
+  describe("error cases", () => {
+    it("throws on non-positive numeric values", () => {
+      expect(() => parseBoxSize(0)).toThrow("Invalid box size");
+      expect(() => parseBoxSize(-100)).toThrow("Invalid box size");
+    });
+
+    it("throws on non-finite numeric values", () => {
+      expect(() => parseBoxSize(Infinity)).toThrow("Invalid box size");
+      expect(() => parseBoxSize(NaN)).toThrow("Invalid box size");
+    });
 
     it("throws on unknown unit", () => {
       expect(() => parseBoxSize("5TB")).toThrow("Unknown size unit");
-    });
-  });
-
-  describe("string input without unit", () => {
-    it("parses plain number string", () => {
-      expect(parseBoxSize("512")).toBe(512);
-      expect(parseBoxSize("1024")).toBe(1024);
+      expect(() => parseBoxSize("10PB")).toThrow("Unknown size unit");
     });
 
-    it("throws on invalid or zero string", () => {
+    it("throws on invalid string format", () => {
       expect(() => parseBoxSize("abc")).toThrow("Invalid box size string");
+      expect(() => parseBoxSize("")).toThrow("Invalid box size string");
+    });
+
+    it("throws on zero string", () => {
       expect(() => parseBoxSize("0")).toThrow("Invalid box size string");
     });
   });
@@ -73,44 +74,64 @@ describe("parseBoxSize", () => {
 // createMemoryPool
 // ============================================================================
 
-describe("memoryPool", () => {
+describe("createMemoryPool", () => {
   // --------------------------------------------------------------------------
-  // Constraint tests
+  // Constraint tests — invariants
   // --------------------------------------------------------------------------
 
   describe("invariants", () => {
-    it("initializes all boxes to CLEAN", () => {
-      const pool = createMemoryPool({ poolSize: 4, boxSize: 64 });
-      for (let i = 0; i < 4; i++) {
-        expect(pool.stateBoard[i]).toBe(BOX_CLEAN);
-      }
+    it("SAB byteLength equals poolSize * boxSize", () => {
+      const pool = createMemoryPool({ poolSize: 4, boxSize: 128 });
+      expect(pool.sab.byteLength).toBe(4 * 128);
     });
 
-    it("maintains invariant: box state is CLEAN, LOCKED, READY, or READING", () => {
-      const pool = createMemoryPool({ poolSize: 2, boxSize: 64 });
-      const validStates = new Set([BOX_CLEAN, BOX_LOCKED, BOX_READY, BOX_READING]);
-
-      pool.markReady(0);
-      expect(validStates.has(pool.stateBoard[0] as BoxState)).toBe(true);
-
-      pool.tryAcquireBox(); // acquires box 1 → LOCKED
-      expect(validStates.has(pool.stateBoard[1] as BoxState)).toBe(true);
-
-      pool.markClean(0);
-      expect(validStates.has(pool.stateBoard[0] as BoxState)).toBe(true);
-
-      pool.markReading(0);
-      expect(validStates.has(pool.stateBoard[0] as BoxState)).toBe(true);
+    it("SAB byteLength is correct with string boxSize", () => {
+      const pool = createMemoryPool({ poolSize: 2, boxSize: "1KB" });
+      expect(pool.sab.byteLength).toBe(2 * 1024);
+      expect(pool.boxSize).toBe(1024);
     });
 
-    it("public API only produces valid state transitions", () => {
+    it("returned object is frozen", () => {
       const pool = createMemoryPool({ poolSize: 1, boxSize: 64 });
-      pool.markReady(0);
-      expect(pool.stateBoard[0]).toBe(BOX_READY);
-      pool.markReading(0);
-      expect(pool.stateBoard[0]).toBe(BOX_READING);
-      pool.markClean(0);
-      expect(pool.stateBoard[0]).toBe(BOX_CLEAN);
+      expect(Object.isFrozen(pool)).toBe(true);
+    });
+
+    it("readBox returns consistent data after writeBox", () => {
+      const pool = createMemoryPool({ poolSize: 1, boxSize: 64 });
+      pool.writeBox(0, new Uint8Array([10, 20, 30]));
+      const view = pool.readBox(0);
+      expect(view[0]).toBe(10);
+      expect(view[1]).toBe(20);
+      expect(view[2]).toBe(30);
+    });
+
+    it("multiple readBox calls return views of same underlying data", () => {
+      const pool = createMemoryPool({ poolSize: 1, boxSize: 64 });
+      pool.writeBox(0, new Uint8Array([42]));
+      const view1 = pool.readBox(0);
+      const view2 = pool.readBox(0);
+      expect(view1.buffer).toBe(view2.buffer);
+      expect(view1.buffer).toBe(pool.sab);
+    });
+
+    it("box isolation: writing to one box does not affect others", () => {
+      const pool = createMemoryPool({ poolSize: 3, boxSize: 32 });
+      pool.writeBox(0, new Uint8Array([1, 2, 3]));
+      pool.writeBox(1, new Uint8Array([4, 5, 6]));
+      pool.writeBox(2, new Uint8Array([7, 8, 9]));
+
+      const b0 = pool.readBox(0);
+      const b1 = pool.readBox(1);
+      const b2 = pool.readBox(2);
+
+      expect(b0[0]).toBe(1);
+      expect(b1[0]).toBe(4);
+      expect(b2[0]).toBe(7);
+
+      // Verify no cross-contamination
+      expect(b0[3]).toBe(0); // box 0 byte 3 untouched
+      expect(b1[3]).toBe(0);
+      expect(b2[3]).toBe(0);
     });
   });
 
@@ -119,68 +140,52 @@ describe("memoryPool", () => {
   // --------------------------------------------------------------------------
 
   describe("pool creation", () => {
-    it("creates pool with correct layout", () => {
+    it("creates pool with correct dimensions", () => {
       const pool = createMemoryPool({ poolSize: 4, boxSize: 128 });
-
       expect(pool.poolSize).toBe(4);
       expect(pool.boxSize).toBe(128);
       expect(pool.sab).toBeInstanceOf(SharedArrayBuffer);
-      expect(pool.stateBoard).toBeInstanceOf(Int32Array);
-      expect(pool.stateBoard.length).toBe(4);
-      expect(pool.leaseTracker).toBeInstanceOf(BigInt64Array);
-      expect(pool.leaseTracker.length).toBe(4);
-      expect(pool.dataRegion).toBeInstanceOf(Uint8Array);
-      expect(pool.dataRegion.length).toBe(4 * 128);
     });
 
-    it("accepts string boxSize", () => {
+    it("accepts string boxSize and resolves it", () => {
       const pool = createMemoryPool({ poolSize: 2, boxSize: "1KB" });
       expect(pool.boxSize).toBe(1024);
-      expect(pool.dataRegion.length).toBe(2 * 1024);
     });
 
-    it("returns frozen object", () => {
+    it("exposes readBox and writeBox as functions", () => {
       const pool = createMemoryPool({ poolSize: 1, boxSize: 64 });
-      expect(Object.isFrozen(pool)).toBe(true);
+      expect(typeof pool.readBox).toBe("function");
+      expect(typeof pool.writeBox).toBe("function");
     });
   });
 
-  describe("tryAcquireBox", () => {
-    it("acquires first CLEAN box and returns Lock", () => {
-      const pool = createMemoryPool({ poolSize: 3, boxSize: 256 });
-      const lock = pool.tryAcquireBox();
-
-      expect(lock).not.toBeNull();
-      expect(lock!.boxIndex).toBe(0);
-      expect(lock!.length).toBe(256);
-      expect(lock!.byteOffset).toBe(pool.getBoxOffset(0));
-      expect(pool.stateBoard[0]).toBe(BOX_LOCKED);
+  describe("readBox", () => {
+    it("returns Uint8Array view of correct size", () => {
+      const pool = createMemoryPool({ poolSize: 1, boxSize: 256 });
+      const view = pool.readBox(0);
+      expect(view).toBeInstanceOf(Uint8Array);
+      expect(view.length).toBe(256);
     });
 
-    it("skips LOCKED boxes", () => {
-      const pool = createMemoryPool({ poolSize: 3, boxSize: 64 });
-      pool.tryAcquireBox(); // locks box 0
-      const lock = pool.tryAcquireBox();
-      expect(lock).not.toBeNull();
-      expect(lock!.boxIndex).toBe(1);
-    });
-
-    it("returns null when pool exhausted", () => {
-      const pool = createMemoryPool({ poolSize: 2, boxSize: 64 });
-      pool.tryAcquireBox();
-      pool.tryAcquireBox();
-      expect(pool.tryAcquireBox()).toBeNull();
-    });
-
-    it("returns frozen Lock object", () => {
+    it("returns zero-initialized view on fresh pool", () => {
       const pool = createMemoryPool({ poolSize: 1, boxSize: 64 });
-      const lock = pool.tryAcquireBox();
-      expect(Object.isFrozen(lock)).toBe(true);
+      const view = pool.readBox(0);
+      for (let i = 0; i < view.length; i++) {
+        expect(view[i]).toBe(0);
+      }
+    });
+
+    it("returns zero-copy view — modifications reflect in SAB", () => {
+      const pool = createMemoryPool({ poolSize: 1, boxSize: 64 });
+      const view = pool.readBox(0);
+      view[0] = 99;
+      const view2 = pool.readBox(0);
+      expect(view2[0]).toBe(99);
     });
   });
 
-  describe("readBox and writeBox", () => {
-    it("writes data and reads it back", () => {
+  describe("writeBox", () => {
+    it("copies data into correct box position", () => {
       const pool = createMemoryPool({ poolSize: 2, boxSize: 64 });
       pool.writeBox(0, new Uint8Array([1, 2, 3, 4, 5]));
       const view = pool.readBox(0);
@@ -189,18 +194,6 @@ describe("memoryPool", () => {
       expect(view[2]).toBe(3);
       expect(view[3]).toBe(4);
       expect(view[4]).toBe(5);
-    });
-
-    it("readBox returns zero-copy view (subarray, not copy)", () => {
-      const pool = createMemoryPool({ poolSize: 1, boxSize: 64 });
-      const view1 = pool.readBox(0);
-      const view2 = pool.readBox(0);
-
-      expect(view1.buffer).toBe(view2.buffer);
-      expect(view1.buffer).toBe(pool.sab);
-
-      view1[0] = 99;
-      expect(view2[0]).toBe(99);
     });
 
     it("truncates data larger than boxSize", () => {
@@ -212,157 +205,67 @@ describe("memoryPool", () => {
       expect(view[7]).toBe(0xAA);
     });
 
-    it("handles empty data write", () => {
+    it("leaves trailing zeros for data smaller than boxSize", () => {
+      const pool = createMemoryPool({ poolSize: 1, boxSize: 16 });
+      pool.writeBox(0, new Uint8Array([1, 2, 3]));
+      const view = pool.readBox(0);
+      expect(view[0]).toBe(1);
+      expect(view[1]).toBe(2);
+      expect(view[2]).toBe(3);
+      expect(view[3]).toBe(0);
+      expect(view[15]).toBe(0);
+    });
+
+    it("multiple writes to different boxes work independently", () => {
+      const pool = createMemoryPool({ poolSize: 3, boxSize: 16 });
+      pool.writeBox(0, new Uint8Array([10]));
+      pool.writeBox(1, new Uint8Array([20]));
+      pool.writeBox(2, new Uint8Array([30]));
+
+      expect(pool.readBox(0)[0]).toBe(10);
+      expect(pool.readBox(1)[0]).toBe(20);
+      expect(pool.readBox(2)[0]).toBe(30);
+    });
+
+    it("handles empty data write without error", () => {
       const pool = createMemoryPool({ poolSize: 1, boxSize: 64 });
       pool.writeBox(0, new Uint8Array(0));
       expect(pool.readBox(0)[0]).toBe(0);
     });
-
-    it("isolates writes between boxes", () => {
-      const pool = createMemoryPool({ poolSize: 2, boxSize: 32 });
-      pool.writeBox(0, new Uint8Array([1, 2, 3]));
-      pool.writeBox(1, new Uint8Array([4, 5, 6]));
-      expect(pool.readBox(0)[0]).toBe(1);
-      expect(pool.readBox(1)[0]).toBe(4);
-    });
   });
 
-  describe("getBoxOffset", () => {
-    it("returns correct offset for box 0", () => {
-      const pool = createMemoryPool({ poolSize: 4, boxSize: 128 });
-      expect(pool.getBoxOffset(0)).toBe(pool.dataRegion.byteOffset);
+  // --------------------------------------------------------------------------
+  // Non-happy path
+  // --------------------------------------------------------------------------
+
+  describe("error handling", () => {
+    it("throws on invalid poolSize (0, negative, non-finite)", () => {
+      expect(() => createMemoryPool({ poolSize: 0, boxSize: 64 })).toThrow(
+        "Invalid poolSize",
+      );
+      expect(() => createMemoryPool({ poolSize: -1, boxSize: 64 })).toThrow(
+        "Invalid poolSize",
+      );
+      expect(() => createMemoryPool({ poolSize: NaN, boxSize: 64 })).toThrow(
+        "Invalid poolSize",
+      );
+      expect(() => createMemoryPool({ poolSize: Infinity, boxSize: 64 })).toThrow(
+        "Invalid poolSize",
+      );
     });
 
-    it("returns sequential offsets", () => {
-      const pool = createMemoryPool({ poolSize: 4, boxSize: 128 });
-      const off0 = pool.getBoxOffset(0);
-      const off1 = pool.getBoxOffset(1);
-      const off2 = pool.getBoxOffset(2);
-      expect(off1 - off0).toBe(128);
-      expect(off2 - off1).toBe(128);
-    });
-
-    it("throws on negative or out-of-range index", () => {
+    it("readBox throws RangeError on out-of-bounds index", () => {
       const pool = createMemoryPool({ poolSize: 2, boxSize: 64 });
-      expect(() => pool.getBoxOffset(-1)).toThrow(RangeError);
-      expect(() => pool.getBoxOffset(2)).toThrow(RangeError);
-      expect(() => pool.getBoxOffset(999)).toThrow(RangeError);
-    });
-  });
-
-  // --------------------------------------------------------------------------
-  // State transitions
-  // --------------------------------------------------------------------------
-
-  describe("markReady", () => {
-    it("sets box state to READY", () => {
-      const pool = createMemoryPool({ poolSize: 1, boxSize: 64 });
-      pool.markReady(0);
-      expect(pool.stateBoard[0]).toBe(BOX_READY);
+      expect(() => pool.readBox(-1)).toThrow(RangeError);
+      expect(() => pool.readBox(2)).toThrow(RangeError);
+      expect(() => pool.readBox(999)).toThrow(RangeError);
     });
 
-    it("throws on out-of-range index", () => {
-      const pool = createMemoryPool({ poolSize: 1, boxSize: 64 });
-      expect(() => pool.markReady(1)).toThrow(RangeError);
-    });
-  });
-
-  describe("markReading", () => {
-    it("sets box state to READING(3)", () => {
-      const pool = createMemoryPool({ poolSize: 1, boxSize: 64 });
-      pool.markReading(0);
-      expect(pool.stateBoard[0]).toBe(BOX_READING);
-    });
-
-    it("throws on out-of-range index", () => {
-      const pool = createMemoryPool({ poolSize: 1, boxSize: 64 });
-      expect(() => pool.markReading(1)).toThrow(RangeError);
-      expect(() => pool.markReading(-1)).toThrow(RangeError);
-    });
-  });
-
-  describe("markClean", () => {
-    it("sets box state to CLEAN", () => {
-      const pool = createMemoryPool({ poolSize: 1, boxSize: 64 });
-      pool.markReady(0);
-      pool.markClean(0);
-      expect(pool.stateBoard[0]).toBe(BOX_CLEAN);
-    });
-
-    it("clears lease when marking clean", () => {
-      const pool = createMemoryPool({ poolSize: 1, boxSize: 64 });
-      pool.setLease(0, Date.now() + 60_000);
-      expect(pool.isLeaseExpired(0)).toBe(false);
-      pool.markClean(0);
-      expect(pool.isLeaseExpired(0)).toBe(true);
-    });
-
-    it("throws on out-of-range index", () => {
-      const pool = createMemoryPool({ poolSize: 1, boxSize: 64 });
-      expect(() => pool.markClean(1)).toThrow(RangeError);
-    });
-  });
-
-  describe("full state transition cycle", () => {
-    it("CLEAN → LOCKED → READY → READING → CLEAN", () => {
-      const pool = createMemoryPool({ poolSize: 1, boxSize: 64 });
-
-      // Start: CLEAN
-      expect(pool.stateBoard[0]).toBe(BOX_CLEAN);
-
-      // CLEAN → LOCKED (tryAcquireBox)
-      const lock = pool.tryAcquireBox();
-      expect(lock).not.toBeNull();
-      expect(pool.stateBoard[0]).toBe(BOX_LOCKED);
-
-      // LOCKED → READY (markReady)
-      pool.markReady(0);
-      expect(pool.stateBoard[0]).toBe(BOX_READY);
-
-      // READY → READING (markReading)
-      pool.markReading(0);
-      expect(pool.stateBoard[0]).toBe(BOX_READING);
-
-      // READING → CLEAN (markClean)
-      pool.markClean(0);
-      expect(pool.stateBoard[0]).toBe(BOX_CLEAN);
-    });
-  });
-
-  // --------------------------------------------------------------------------
-  // Lease tracking
-  // --------------------------------------------------------------------------
-
-  describe("setLease / isLeaseExpired", () => {
-    it("returns true when no lease set (0n)", () => {
-      const pool = createMemoryPool({ poolSize: 1, boxSize: 64 });
-      expect(pool.isLeaseExpired(0)).toBe(true);
-    });
-
-    it("returns false for future expiry", () => {
-      const pool = createMemoryPool({ poolSize: 1, boxSize: 64 });
-      pool.setLease(0, Date.now() + 60_000);
-      expect(pool.isLeaseExpired(0)).toBe(false);
-    });
-
-    it("returns true for past expiry", () => {
-      const pool = createMemoryPool({ poolSize: 1, boxSize: 64 });
-      pool.setLease(0, Date.now() - 1000);
-      expect(pool.isLeaseExpired(0)).toBe(true);
-    });
-
-    it("clearLease sets to 0n", () => {
-      const pool = createMemoryPool({ poolSize: 1, boxSize: 64 });
-      pool.setLease(0, Date.now() + 60_000);
-      pool.clearLease(0);
-      expect(pool.isLeaseExpired(0)).toBe(true);
-    });
-
-    it("throws on out-of-range index", () => {
-      const pool = createMemoryPool({ poolSize: 1, boxSize: 64 });
-      expect(() => pool.setLease(1, Date.now())).toThrow(RangeError);
-      expect(() => pool.clearLease(1)).toThrow(RangeError);
-      expect(() => pool.isLeaseExpired(1)).toThrow(RangeError);
+    it("writeBox throws RangeError on out-of-bounds index", () => {
+      const pool = createMemoryPool({ poolSize: 2, boxSize: 64 });
+      expect(() => pool.writeBox(-1, new Uint8Array([1]))).toThrow(RangeError);
+      expect(() => pool.writeBox(2, new Uint8Array([1]))).toThrow(RangeError);
+      expect(() => pool.writeBox(999, new Uint8Array([1]))).toThrow(RangeError);
     });
   });
 
@@ -374,29 +277,16 @@ describe("memoryPool", () => {
     it("works with poolSize 1", () => {
       const pool = createMemoryPool({ poolSize: 1, boxSize: 32 });
       expect(pool.poolSize).toBe(1);
-      expect(pool.stateBoard.length).toBe(1);
-
-      const lock = pool.tryAcquireBox();
-      expect(lock).not.toBeNull();
-      expect(lock!.boxIndex).toBe(0);
-      expect(pool.tryAcquireBox()).toBeNull();
-
-      pool.markClean(0);
-      expect(pool.tryAcquireBox()).not.toBeNull();
+      pool.writeBox(0, new Uint8Array([42]));
+      expect(pool.readBox(0)[0]).toBe(42);
     });
 
     it("works with boxSize 1", () => {
       const pool = createMemoryPool({ poolSize: 2, boxSize: 1 });
       expect(pool.boxSize).toBe(1);
-      expect(pool.dataRegion.length).toBe(2);
+      expect(pool.sab.byteLength).toBe(2);
       pool.writeBox(0, new Uint8Array([42]));
       expect(pool.readBox(0)[0]).toBe(42);
-    });
-
-    it("throws on invalid poolSize", () => {
-      expect(() => createMemoryPool({ poolSize: 0, boxSize: 64 })).toThrow("Invalid poolSize");
-      expect(() => createMemoryPool({ poolSize: -1, boxSize: 64 })).toThrow("Invalid poolSize");
-      expect(() => createMemoryPool({ poolSize: NaN, boxSize: 64 })).toThrow("Invalid poolSize");
     });
 
     it("writeBox with data exactly boxSize fills completely", () => {
@@ -409,9 +299,33 @@ describe("memoryPool", () => {
       expect(view[3]).toBe(40);
     });
 
-    it("readBox view length equals boxSize", () => {
-      const pool = createMemoryPool({ poolSize: 1, boxSize: 256 });
-      expect(pool.readBox(0).length).toBe(256);
+    it("handles maximum reasonable buffer size", () => {
+      const pool = createMemoryPool({ poolSize: 1, boxSize: "1MB" });
+      expect(pool.boxSize).toBe(1024 * 1024);
+      expect(pool.sab.byteLength).toBe(1024 * 1024);
+      const view = pool.readBox(0);
+      expect(view.length).toBe(1024 * 1024);
+    });
+
+    it("concurrent-style access: interleaved reads and writes are consistent", () => {
+      const pool = createMemoryPool({ poolSize: 4, boxSize: 64 });
+
+      // Write to all boxes
+      for (let i = 0; i < 4; i++) {
+        pool.writeBox(i, new Uint8Array([i + 1]));
+      }
+
+      // Read all boxes — each should have its own value
+      for (let i = 0; i < 4; i++) {
+        expect(pool.readBox(i)[0]).toBe(i + 1);
+      }
+
+      // Overwrite box 2, verify others unchanged
+      pool.writeBox(2, new Uint8Array([99]));
+      expect(pool.readBox(0)[0]).toBe(1);
+      expect(pool.readBox(1)[0]).toBe(2);
+      expect(pool.readBox(2)[0]).toBe(99);
+      expect(pool.readBox(3)[0]).toBe(4);
     });
   });
 });

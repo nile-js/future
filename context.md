@@ -1,17 +1,17 @@
 # Project Context: @nilejs/future
 
 ## Overview
-High-performance actor/promise primitives for **Bun**, Erlang-inspired. Isolates execution in worker threads with automatic cleanup, two-tier communication, supervision trees, auto-restart, and configurable diagnostics.
+High-performance actor/promise primitives for **Bun**, Erlang-inspired. Isolates execution in worker threads with automatic cleanup, two-tier communication, supervision trees, auto-restart, and configurable diagnostics. Actors communicate via immutable messages routed through per-actor inboxes. Tier 2 uses zero-copy SAB boxes with supervisor-managed state — no CAS, no READING state, no atomic contention. Key features: epoch-based Lock prevents use-after-free, FIFO write queue when boxes exhausted, ShareConfig authorization (owner/group/linked/explicit), per-actor inbox queues with deterministic delivery.
 
 ## Key Files
 | File | Purpose |
 |------|---------|
 | `src/future/types.ts` | All type contracts. Import from here. |
-| `src/future/memory-pool.ts` | SharedArrayBuffer layout + atomic lock ops |
+| `src/future/memory-pool.ts` | SharedArrayBuffer data boxes (no state board, no CAS) |
 | `src/future/pubsub.ts` | Tier 1 message bus + Worker message channel |
 | `src/future/worker-bootstrap.ts` | Worker thread entry point |
 | `src/future/actor.ts` | ActorRef factory |
-| `src/future/supervisor.ts` | createSupervisor factory (core orchestrator) |
+| `src/future/supervisor.ts` | createSupervisor factory (core orchestrator, inbox routing, auth) |
 | `src/future/resource-manager.ts` | Proxy-based intent relay |
 | `src/future/strategies.ts` | Supervision restart strategy types + selectors |
 | `src/future/restart.ts` | Backoff calculation + retry orchestration |
@@ -24,7 +24,7 @@ High-performance actor/promise primitives for **Bun**, Erlang-inspired. Isolates
 ## Conventions
 - **No classes**. Factory functions only. `createSupervisor()` returns plain object with methods.
 - **Named params**: `{ name, email }` not `(name, email)`.
-- **Max 400 LOC/file** (supervisor.ts is ~500 LOC as the core orchestrator — acceptable exception).
+- **Max 400 LOC/file** (supervisor.ts may exceed as core orchestrator — acceptable exception).
 - **`type` over `interface`**. Ban `enum`.
 - **JSDoc** for all public APIs. Explain WHY not what.
 - **`safeTry`** for error handling. No raw try/catch.
@@ -49,42 +49,107 @@ High-performance actor/promise primitives for **Bun**, Erlang-inspired. Isolates
 - **Worker crash detection**: `worker.on("exit")` and `worker.on("error")` handlers in `spawnActor` automatically terminate the actor and clean up resources if the worker thread crashes (uncaught exception, OOM, segfault).
 
 ### Two-Tier Communication
-- **Tier 1 (Control)**: `postMessage` — signals, heartbeats, resource intents, pubsub, child spawn
-- **Tier 2 (Data)**: `SharedArrayBuffer` — zero-copy large data transfer
+- **Tier 1 (Control)**: `postMessage` — signals, status updates, heartbeats, resource intents, pubsub, child spawn, inbox delivery
+- **Tier 2 (Data)**: `SharedArrayBuffer` — zero-copy large data transfer. Workers write to assigned boxes, data is immutable after commit. No CAS. No atomic contention.
+
+### Message Shape
+```typescript
+type FmtType = "json" | "string" | "binary" | "cbor";
+
+type Message = {
+  msg: string;           // Matching key for matchAll dispatch
+  type?: FmtType;        // Required for Tier 2. Absent for Tier 1 (json assumed)
+  data?: unknown;        // Tier 1: deserialized JSON. Tier 2: absent (use handle + ctx.read)
+  handle?: Lock;         // Tier 2 SAB reference. Absent for Tier 1
+  from: ActorId;         // Auto-injected by supervisor. Sender never sets this.
+};
+```
 
 ### Memory Pool Layout (per supervisor)
-- State Board: `Int32Array[poolSize]` — 0=CLEAN, 1=LOCKED, 2=READY, 3=READING
-- Lease Tracker: `BigInt64Array[poolSize]` — `expiresAt` timestamp ms, 0n = no lease
-- Data Boxes: `Uint8Array[poolSize * boxSize]` — fixed-size segments
+- **Data Boxes only**: `Uint8Array[poolSize * boxSize]` — fixed-size segments
+- **No State Board**. No `Int32Array` for box states. No `BigInt64Array` for leases.
+- All state tracking moves to supervisor-side `BoxEntry[]` plain objects.
+- No CAS operations on the SAB. The SAB is raw byte storage only.
+
+### Supervisor-Side State Tracking
+```typescript
+type BoxEntry = {
+  state: "FREE" | "WRITING" | "READY";
+  from: ActorId;
+  msg: string;
+  type: FmtType;
+  share: ShareConfig;
+  refCount: number;
+  expiresAt: number;
+  writer: ActorId | null;
+  readers: Set<ActorId>;
+};
+```
+
+Box identity is an index into `BoxEntry[]`, wrapped in an opaque `Lock` type with epoch:
+```typescript
+type Lock = { boxIndex: number; epoch: number };
+```
+The `epoch` prevents use-after-free: if a box is recycled and reassigned, old handles with a stale epoch are rejected.
 
 ### State Machine
 ```
-CLEAN(0) --acquireLock()--> LOCKED(1) --ctx.done()--> READY(2) --read()--> READING(3) --done()--> CLEAN(0)
+FREE → WRITING → READY → FREE
 ```
-- **READING(3)**: One or more active readers. Reference count tracked by supervisor. Last reader triggers `READING→CLEAN`.
-- All state transitions are main-thread serialized.
+- **FREE**: Box available for assignment. No writer. No data.
+- **WRITING**: One writer assigned. Worker copies data into SAB segment. Mutable.
+- **READY**: Data committed. Immutable. `refCount` tracks active readers. No READING state.
+- **Transition to FREE**: When `refCount` reaches 0 (all readers released), box returns to FREE.
 
-### Lock Flow
-1. Worker sends `LOCK_REQUEST` → main thread
-2. Main thread finds CLEAN box, sets LOCKED, sets lease
-3. Main thread sends `LOCK_GRANTED` with `{ boxIndex, byteOffset, length }`
-4. Worker writes data via `ctx.deposit(lock, data)`
-5. Worker calls `ctx.done(lock)` → main marks READY, notifies subscribers
-6. **Reader** calls `actor.read(lock)` (main thread) or `ctx.read(lock)` (worker) → main transitions READY→READING, increments ref count
-7. **Reader** calls `actor.done(lock)` or `ctx.done(lock)` → main verifies actor actually has box in `state.reads` before decrementing. If 0: READING→CLEAN, serves queue. Guard prevents double-decrement from buggy/malicious actors.
+All state transitions are deterministic and managed by the supervisor in response to worker protocol messages. No CAS. No atomic operations on data.
 
-> **Worker reads:** `ctx.read(lock)` is async. Worker sends `READ_START` with unique `requestId` → main approves with `READ_GRANTED` (echoes `requestId`) → worker creates SAB view → worker calls `ctx.done(lock)` → main decrements count. `requestId` prevents promise collision when same worker reads same box concurrently. Safe because all state transitions are main-thread serialized.
+### Write Flow (Tier 2)
+1. Worker calls `ctx.write({ msg, type, data, share })` → sends `WRITE_REQUEST` to main thread
+2. Main thread finds FREE box (or queues in FIFO write queue if none available), sets `BoxEntry.state = WRITING`, assigns writer, increments epoch
+3. Main thread sends `WRITE_GRANTED { lock: { boxIndex, epoch } }` to worker
+4. Worker copies data into SAB segment at `lock.boxIndex`, strips trailing null bytes
+5. Worker sends `COMMIT { lock }` → main marks `BoxEntry.state = READY`, computes `expiresAt`, routes to authorized inboxes
+6. Main thread delivers `INBOX { handle, from, msg, type }` to authorized readers
+
+### Read Flow (Tier 2)
+1. Reader receives `INBOX` message with `handle`, `from`, `msg`, `type`
+2. Reader calls `ctx.read(m)` → returns chainable decoder `{ json(), string(), binary(), cbor(), raw() }` or `null` if no handle
+3. Data is read directly from SAB. Zero-copy. No async round-trip. No state transition.
+4. Reader calls `ctx.release(handle)` → sends `RELEASE { lock }` to main
+5. Main decrements `refCount`. If 0 → box FREE, serve write queue if pending.
+
+### Per-Actor Inbox
+```typescript
+type InboxEntry = {
+  handle: Lock;
+  from: ActorId;
+  msg: string;
+  type: FmtType;
+};
+
+const inboxes: Map<ActorId, InboxEntry[]>;
+```
+- Supervisor routes messages to actor inboxes based on `share` authorization
+- When actor completes current message handler, supervisor delivers next inbox entry via `INBOX` protocol message
+- Inbox entries hold Lock references, not data copies
+
+### Authorization Model (ShareConfig)
+- `"owner"` (default): Only the writer actor can read. Main-thread subscribers can always read.
+- `"group"`: All actors in the same supervision group can read.
+- `"linked"`: Actors linked to the writer can read (bi-directional and uni-directional links).
+- Explicit `ActorId[]`: Only specified actor IDs can read.
+- Enforcement: Supervisor checks `readers` set in `BoxEntry` on every `INBOX` delivery. Unauthorized read attempts are silently dropped.
 
 ### Resource Manager
 - `ctx.resources.db.query()` → Proxy intercepts → `RESOURCE_REQUEST` → main thread validates (Zod) → executes handler → `RESOURCE_RESPONSE`
 - Each resource can define `release()` for cleanup on shutdown
 
 ### Lease System
-- `acquireLock()` sets `expiresAt = now + leaseMs`
-- Implicit heartbeat on `self.send()` and `ctx.deposit()`
-- Explicit heartbeat via `ctx.heartbeat()`
-- Opportunistic cleanup: on ANY actor-supervisor interaction, scan leases. Expired → terminate actor, recycle box.
-- **READING boxes**: `checkLeases()` handles READING state — terminates all actors reading the box, deletes `readerCounts` entry, then marks CLEAN.
+- `expiresAt` computed at COMMIT time and stored in `BoxEntry`
+- Reset when a new reader acquires a handle to a READY box
+- Opportunistic cleanup: on ANY actor-supervisor interaction (`self.send`, `ctx.write`, `ctx.release`, `ctx.heartbeat`, resource call), check all `BoxEntry` entries for expired leases
+- Lease expiry: force-release all reader refs, set box FREE, terminate writer if in WRITING state, serve write queue
+- No `setTimeout` overhead. Cleanup is deterministic and interaction-driven.
 
 ### Supervision & Auto-Restart
 - **Root group**: Every supervisor has an implicit root supervision group. `supervisor.spawn()` registers actors here automatically.
@@ -100,7 +165,7 @@ CLEAN(0) --acquireLock()--> LOCKED(1) --ctx.done()--> READY(2) --read()--> READI
 
 ### Diagnostics
 - Configurable via `diagnostics: { enabled, sampleRate, track: {...} }`
-- Per-metric toggles: actorLifetimes, startTimes, processLifetimes, lockAcquisitionTimes, messageLatency, bufferUtilization, heartbeatIntervals, resourceCallLatency
+- Per-metric toggles: actorLifetimes, startTimes, processLifetimes, writeQueueDepth, messageLatency, bufferUtilization, heartbeatIntervals, resourceCallLatency, authorizationEvents, inboxDepth, refCountHistory
 - Sampling: `Math.random() < sampleRate` gates tracking
 - Uses `performance.now()` for timing
 - Zero-cost when disabled (no-op collector)
@@ -111,12 +176,38 @@ CLEAN(0) --acquireLock()--> LOCKED(1) --ctx.done()--> READY(2) --read()--> READI
 - Supervision strategies: `one-for-one` (default), `one-for-all`, `rest-for-one`.
 - Linking = bi-directional suicide pact. Monitoring = uni-directional notification.
 - **Max actors**: Enforced at spawn time.
+- **`self.send(msg, data)`**: Tier 1. `msg` is string matching key. `data` auto-encoded as JSON. `from` auto-injected by supervisor.
+- **`ctx.write({ msg, type, data, share })`**: Tier 2. Single async call. Returns `Promise<Lock>`. Data is `Uint8Array`. Immutable after commit.
+- **`ctx.read(m)`**: Returns chainable decoder `{ json(), string(), binary(), cbor(), raw() }` or `null`. Zero-copy from SAB. No async.
+- **`ctx.release(handle)`**: Decrements ref count. If 0 → FREE.
+- **`from` is always auto-injected** by supervisor. Sender never sets it.
+
+## API Changes (Old → New)
+| Old API | New API | Notes |
+|---------|---------|-------|
+| `ctx.acquireLock()` | `ctx.write({ msg, type, data, share })` | Write replaces acquire+deposit+done |
+| `ctx.deposit(lock, data)` | (merged into `ctx.write`) | Data passed in write call |
+| `ctx.done(lock)` | (merged into `ctx.write`) | Commit is implicit after SAB copy |
+| `ctx.read(lock)` (async) | `ctx.read(m)` (sync, chainable) | Returns decoder, no async round-trip |
+| `actor.read(lock)` (sync) | `actor.read(m)` (sync, chainable) | Returns decoder or null |
+| `actor.done(lock)` | `actor.release(handle)` / `ctx.release(handle)` | Decrements ref count |
+| `LOCK_REQUEST/LOCK_GRANTED` | `WRITE_REQUEST/WRITE_GRANTED` | Protocol rename |
+| `DEPOSIT` | (removed) | Merged into write flow |
+| `DONE` | `COMMIT` | Protocol rename |
+| `READ_START/READ_GRANTED/READ_ERROR` | (removed) | No async read. Data is immutable in SAB. |
+| `READING` state | (removed) | No READING state. READY is immutable. |
+| State Board (`Int32Array`) | (removed) | State tracked in `BoxEntry[]` plain objects |
+| Lease Tracker (`BigInt64Array`) | (removed) | `expiresAt` in `BoxEntry` |
+| `Lock { boxIndex, byteOffset, length }` | `Lock { boxIndex, epoch }` | Epoch prevents use-after-free |
+| `self.send(msg)` | `self.send(msg, data?)` | Now takes optional data param |
+| Open read model | `ShareConfig` authorization | owner/group/linked/explicit list |
+| No inbox | Per-actor inbox queue | Supervisor routes to authorized readers |
 
 ## Testing
 - **Use `bun test`**. Bun has native TypeScript support in worker threads.
 - Tests in `tests/future/*.spec.ts` for future features.
 - Keep existing `tests/*.spec.ts` for slang utilities.
-- **357 tests pass, 0 fail.**
+- **355 tests pass, 0 fail.** (Memory pool: 27 tests. Supervisor: 46 tests. Slang utilities: unchanged.)
 
 ## Runtime Requirement
 - **Bun v1.0+ only**. Node.js is not supported.
@@ -124,22 +215,19 @@ CLEAN(0) --acquireLock()--> LOCKED(1) --ctx.done()--> READY(2) --read()--> READI
 - If Node.js support is needed, it requires a pre-compiled worker bootstrap or `tsx` loader — not currently implemented.
 
 ## Documentation Status
-- `README.md` — Updated with copy-paste runnable examples
-- `spec-final.md` — Updated with named params for resource calls
-- `spec.md` — Marked as deprecated (superseded by spec-final.md)
+- `README.md` — Needs update for new API
+- `spec-final.md` — Current (1400 lines, 20 sections, 8 ADRs). Rewrite complete.
+- `spec.md` — Deprecated (superseded by spec-final.md)
 - `docs/ADR-006-bun-only-runtime.md` — Current
-- `task.md` — Current
-- `context.md` — Current
+- `context.md` — Current (this file)
 
 ## Known Limitations
-- Worker `ctx.read()` requires async round-trip to main thread for state transition. Not as fast as main-thread `actor.read()` but enables safe concurrent reads.
-- `actor.read()` on main thread does NOT auto-clean. Caller must call `actor.done(lock)` after reading. This enables concurrent readers.
-- `readBox()` returns zero-copy SAB view. Caller must call `done()` before the view is used after box cleanup — documented contract.
-- No bounds validation on `lock.boxIndex` in `READ_START` handler. Out-of-range indices fall through to READ_ERROR safely but without explicit guard.
-- No ownership validation for reads. Any actor can read any READY box — by design (open read model).
-- `handleDone` silently ignores DONE for non-matching states (LOCKED/CLEAN/READY when expecting READING). By design — no-op on mismatched state.
+- `ctx.read(m)` returns `null` for all decoders if `m.handle` is absent (Tier 1 message). Callers should check.
+- `actor.read(m)` on main thread returns zero-copy SAB view. Caller must call `actor.release(handle)` after reading. Enables concurrent readers.
+- Epoch-based Lock prevents use-after-free but adds small overhead on box recycling.
+- Write queue blocks requesting worker until a FREE box available. If all boxes busy, writer stalls. Mitigate with sufficient `poolSize`.
+- No bounds validation on `lock.boxIndex` in RELEASE handler. Out-of-range indices should be guarded.
 - `(msg as any)` casts in message handlers bypass TypeScript strictness. Technical debt, not a runtime bug.
-- 100% spec compliance achieved.
 
 ## Boundaries (DO NOT CROSS)
 - `/backend`, `/nile`, `frontend/api` — never touch

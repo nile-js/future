@@ -1,540 +1,304 @@
 import type { Result } from "../result";
 
-// ============================================================================
-// Core Primitives
-// ============================================================================
-
-/** Unique actor identifier */
+/** Unique actor identifier — string for debuggability and hash-map keys */
 export type ActorId = string;
+/** Serialization format for shared-memory messages — determines encode/decode path */
+export type FmtType = "json" | "string" | "binary" | "cbor";
+/** Lock on a shared-memory box. Epoch prevents use-after-free on recycled boxes. */
+export type Lock = { readonly boxIndex: number; readonly epoch: number };
+/**
+ * Share config — controls which actors can read a written message.
+ * "owner" = writer + main-thread subscribers (default). "group" = same supervision group.
+ * "linked" = actors linked to writer. Array = explicit allowlist.
+ */
+export type ShareConfig = "owner" | "group" | "linked" | readonly ActorId[];
 
-/** Memory box lock — represents acquired shared memory */
-export type Lock = {
-  readonly boxIndex: number;
-  readonly byteOffset: number;
-  readonly length: number;
+/** BoxEntry — supervisor-side metadata per box. State machine: FREE → WRITING → READY → FREE */
+export type BoxEntry = {
+  state: "FREE" | "WRITING" | "READY";
+  from: ActorId; msg: string; type: FmtType; share: ShareConfig;
+  refCount: number; expiresAt: number; writer: ActorId | null;
+  readers: Set<ActorId>; epoch: number;
+};
+/** InboxEntry — per-actor inbox item. Handle lets actor read SAB payload via ctx.read(). */
+export type InboxEntry = { readonly handle: Lock; readonly from: ActorId; readonly msg: string; readonly type: FmtType };
+
+/**
+ * Message — unified envelope for Tier 1 (inline JSON) and Tier 2 (SAB reference).
+ * Tier 1: data present, handle absent. Tier 2: handle present, data absent.
+ * Supervisor auto-injects `from`; sender never sets it.
+ */
+export type Message = {
+  readonly msg: string; readonly type?: FmtType; readonly data?: unknown;
+  readonly handle?: Lock; readonly from: ActorId;
 };
 
-/** Box state values */
-export type BoxState = 0 | 1 | 2 | 3;
-/** Box state constant — CLEAN (0). A box ready for acquisition. */
-export const BOX_CLEAN: BoxState = 0;
-/** Box state constant — LOCKED (1). A box currently being written to. */
-export const BOX_LOCKED: BoxState = 1;
-/** Box state constant — READY (2). A box with data ready for reading. */
-export const BOX_READY: BoxState = 2;
-/** Box state constant — READING (3). A box being read by one or more workers. */
-export const BOX_READING: BoxState = 3;
-
-// ============================================================================
-// Actor Self — control surface available inside actor callback
-// ============================================================================
-
-/** Actor self-reference passed into the actor callback */
-export type ActorSelf = {
-  /** Send a Tier 1 signal/status message to subscribers */
-  readonly send: (msg: unknown) => void;
-  /** Unique actor id */
-  readonly id: ActorId;
+/** ActorSelf — minimal self-reference. `send` emits Tier 1 signal to subscribers. */
+export type ActorSelf = { readonly send: (msg: string, data?: unknown) => void; readonly id: ActorId };
+/** ChainableReader — lazy decoder. `raw()` returns zero-copy SAB view (main thread only). */
+export type ChainableReader = {
+  readonly json: () => unknown; readonly string: () => string;
+  readonly binary: () => Uint8Array; readonly cbor: () => unknown; readonly raw: () => Uint8Array;
 };
 
-// ============================================================================
-// Context — injected into every actor callback
-// ============================================================================
-
-/** Formatting utilities available on ctx.fmt */
+/** FormatUtils — encoding/decoding on ctx.fmt. Typed alloc sub-methods allocate SAB-backed views. */
 export type FormatUtils = {
-  /** Allocate a Uint8Array buffer (replaces new Uint8Array) */
-  readonly alloc: (size: number) => Uint8Array;
-  /** Typed allocations */
-  readonly allocU8: (length: number) => Uint8Array;
-  readonly allocI8: (length: number) => Int8Array;
-  readonly allocU16: (length: number) => Uint16Array;
-  readonly allocI16: (length: number) => Int16Array;
-  readonly allocU32: (length: number) => Uint32Array;
-  readonly allocI32: (length: number) => Int32Array;
-  readonly allocU64: (length: number) => BigUint64Array;
-  readonly allocI64: (length: number) => BigInt64Array;
-  readonly allocF32: (length: number) => Float32Array;
-  readonly allocF64: (length: number) => Float64Array;
-  /** Create buffer from data with auto-encoding */
   readonly from: (data: string | object | Uint8Array) => Uint8Array;
-  /** Auto-detect encode (string→UTF8, object→JSON, TypedArray→passthrough) */
   readonly encode: (data: unknown) => Uint8Array;
-  /** Auto-detect decode (JSON→object, string→UTF8, else raw) */
   readonly decode: (buffer: Uint8Array) => unknown;
-  /** Explicit JSON encoding */
   readonly json: { readonly encode: (obj: unknown) => Uint8Array; readonly decode: (buf: Uint8Array) => unknown };
-  /** Explicit string encoding */
   readonly string: { readonly encode: (str: string) => Uint8Array; readonly decode: (buf: Uint8Array) => string };
+  readonly cbor: { readonly encode: (data: unknown) => Uint8Array; readonly decode: (buf: Uint8Array) => unknown };
+  readonly alloc: ((size: number) => Uint8Array) & {
+    readonly u8: (length: number) => Uint8Array; readonly i8: (length: number) => Int8Array;
+    readonly u16: (length: number) => Uint16Array; readonly i16: (length: number) => Int16Array;
+    readonly u32: (length: number) => Uint32Array; readonly i32: (length: number) => Int32Array;
+    readonly u64: (length: number) => BigUint64Array; readonly i64: (length: number) => BigInt64Array;
+    readonly f32: (length: number) => Float32Array; readonly f64: (length: number) => Float64Array;
+  };
 };
 
-/** Actor execution context */
+/**
+ * ActorContext — actor's gateway to supervisor. `write` acquires box + encodes data.
+ * `read` decodes a Message's handle into ChainableReader (null for Tier 1).
+ * `release` frees a box when done reading.
+ */
 export type ActorContext = {
-  /** Acquire a memory box lock from the pool */
-  readonly acquireLock: () => Promise<Result<Lock, string>>;
-  /** Write data to a locked box */
-  readonly deposit: (lock: Lock, data: Uint8Array) => void;
-  /** Finalize write, notify subscribers, release lock */
-  readonly done: (lock: Lock) => void;
-  /** Explicit heartbeat — reset lease timer during CPU-intensive loops */
+  readonly write: (params: {
+    readonly msg: string; readonly type: FmtType; readonly data: Uint8Array; readonly share?: ShareConfig;
+  }) => Promise<Result<Lock, string>>;
+  readonly read: (msg: Message) => ChainableReader | null;
+  readonly release: (handle: Lock) => void;
   readonly heartbeat: () => void;
-  /** Resources proxy — intent relay to main thread */
   readonly resources: Record<string, Record<string, (...args: unknown[]) => Promise<unknown>>>;
-  /** Link to another actor (bi-directional failure propagation) */
   readonly link: (actor: ActorRef) => void;
-  /** Monitor another actor (uni-directional notification) */
   readonly monitor: (actor: ActorRef) => void;
-  /** Spawn a child actor */
   readonly spawn: (callback: ActorCallback) => Promise<ActorRef>;
-  /** Terminate self */
   readonly terminate: () => void;
-  /** Read data from a READY box (async — sends READ_START, awaits READ_GRANTED) */
-  readonly read: (lock: Lock) => Promise<Result<Uint8Array, string>>;
-  /** Check if actor has been terminated */
   readonly isCancelled: boolean;
-  /** Formatting utilities */
   readonly fmt: FormatUtils;
 };
 
-// ============================================================================
-// Actor Callback
-// ============================================================================
+/** Actor callback — serialized to worker, no outer scope. */
+export type ActorCallback = (self: ActorSelf, msg: unknown, ctx: ActorContext) => void | Promise<void>;
 
-/** Actor callback signature — serialized, no outer scope */
-export type ActorCallback = (
-  self: ActorSelf,
-  msg: unknown,
-  ctx: ActorContext,
-) => void | Promise<void>;
-
-// ============================================================================
-// Actor Reference — returned by supervisor.spawn()
-// ============================================================================
-
-/** Reference to a spawned actor */
+/** ActorRef — main-thread handle to a running actor. read/release are synchronous. */
 export type ActorRef = {
   readonly id: ActorId;
-  /** Send a message to the actor (triggers callback execution) */
   readonly spawn: (msg: unknown) => void;
-  /** Subscribe to Tier 1 messages from this actor */
-  readonly subscribe: (fn: (msg: unknown) => void) => () => void;
-  /** Terminate the actor immediately (kills thread) */
+  readonly subscribe: (fn: (msg: Message) => void) => () => void;
   readonly terminate: () => void;
-  /** Read data from a deposited box (main-thread synchronous) */
-  readonly read: (lock: Lock) => Uint8Array;
-  /** Signal that reading is complete — decrements reader count, cleans if last */
-  readonly done: (lock: Lock) => void;
-  /** Get actor diagnostics */
+  readonly read: (msg: Message) => ChainableReader | null;
+  readonly release: (handle: Lock) => void;
   readonly getDiagnostics: () => Result<ActorDiagnostics, string>;
-  /** Link this actor to another (bi-directional) */
   readonly link: (other: ActorRef) => void;
-  /** Monitor another actor (uni-directional) */
   readonly monitor: (other: ActorRef) => void;
 };
 
-// ============================================================================
-// Supervision
-// ============================================================================
+/** Per-actor config — optional overrides for timeout and naming. */
+export type ActorConfig = { readonly name?: string; readonly timeoutMs?: number };
 
-/**
- * Supervision strategy — controls failure blast radius across actors.
- * "one-for-one": only the failed actor restarts (isolated failures)
- * "one-for-all": all actors in group restart (cascading failures)
- * "rest-for-one": failed actor and all siblings after it restart (pipeline failures)
- */
+/** Strategy — controls failure blast radius: one-for-one, one-for-all, rest-for-one */
 export type SupervisionStrategy = "one-for-one" | "one-for-all" | "rest-for-one";
-
-/**
- * Retry backoff config — prevents thundering herd on rapid failures.
- * Exponential backoff spreads restarts over time, linear for predictable cadence.
- */
-export type RetryConfig = {
-  readonly max: number;
-  readonly backoff: "exponential" | "linear" | "fixed";
-  readonly delayMs?: number;
-};
-
-/**
- * Actor group config — isolates supervision policies per group.
- * Each group has its own strategy and retry policy, independent of other groups.
- */
-export type ActorGroupConfig = {
-  readonly strategy: SupervisionStrategy;
-  readonly retry?: RetryConfig;
-};
-
-/** Actor group for supervision */
+/** Retry backoff — prevents thundering herd on rapid failures. */
+export type RetryConfig = { readonly max: number; readonly backoff: "exponential" | "linear" | "fixed"; readonly delayMs?: number };
+/** Actor group config — isolates supervision policies per group. */
+export type ActorGroupConfig = { readonly strategy: SupervisionStrategy; readonly retry?: RetryConfig };
+/** Actor group — scoped spawn/terminate with shared supervision policy. */
 export type ActorGroup = {
   readonly id: string;
   readonly spawn: (callback: ActorCallback, options?: ActorConfig) => ActorRef;
   readonly terminateAll: () => void;
-  readonly read: (lock: Lock) => Uint8Array;
-  readonly done: (lock: Lock) => void;
+  readonly read: (msg: Message) => ChainableReader | null;
+  readonly release: (handle: Lock) => void;
 };
 
-// ============================================================================
-// Resource Manager
-// ============================================================================
-
-/**
- * Resource method config — schemas enforce contract at boundaries.
- * Input/output Zod schemas validate messages before/after handler execution.
- */
+/** Resource method config — Zod schemas enforce contract at boundaries. */
 export type ResourceMethodConfig = {
   readonly input: import("zod").ZodTypeAny;
   readonly output: import("zod").ZodTypeAny;
   readonly handler: (args: unknown) => unknown | Promise<unknown>;
 };
-
 /**
- * Resource config — release hooks guarantee cleanup on actor termination.
- * If a method returns a function, it's called when the actor shuts down.
+ * Resource config — method configs or cleanup functions. `release` is a top-level
+ * cleanup hook called on actor termination, distinct from method-level cleanup.
  */
 export type ResourceConfig = {
   readonly [method: string]: ResourceMethodConfig | (() => void | Promise<void>) | undefined;
+  readonly release?: () => void | Promise<void>;
 };
+/** Resources config — centralizes resource definitions for the supervisor. */
+export type ResourcesConfig = { readonly [resourceName: string]: ResourceConfig };
 
-/**
- * Resources config — centralizes resource definitions for the supervisor.
- * Resources are shared across all actors; their methods are invoked via ctx.resources.
- */
-export type ResourcesConfig = {
-  readonly [resourceName: string]: ResourceConfig;
-};
-
-// ============================================================================
-// Supervisor Configuration
-// ============================================================================
-
-/**
- * Memory config — poolSize/boxSize tradeoff balances concurrency vs memory usage.
- * More boxes per pool = higher concurrency but more memory overhead per slot.
- */
-export type MemoryConfig = {
-  readonly poolSize: number;
-  readonly boxSize: string | number;
-};
-
-/**
- * Timeout config — lease prevents indefinite resource holding.
- * If an actor doesn't heartbeat within defaultLeaseMs, its locks are forcibly released.
- */
-export type TimeoutConfig = {
-  readonly defaultLeaseMs: number;
-  readonly actorTimeouts?: Record<string, number>;
-};
-
-/**
- * Diagnostics config — zero-cost when disabled (enabled: false).
- * When enabled, sampleRate controls collection overhead; individual flags opt-in to specific metrics.
- */
+/** Memory config — poolSize/boxSize tradeoff: concurrency vs memory overhead. */
+export type MemoryConfig = { readonly poolSize: number; readonly boxSize: string | number };
+/** Timeout config — lease prevents indefinite resource holding. */
+export type TimeoutConfig = { readonly defaultLeaseMs: number; readonly actorTimeouts?: Record<string, number> };
+/** Diagnostics config — zero-cost when disabled. sampleRate controls overhead. */
 export type DiagnosticsConfig = {
-  readonly enabled: boolean;
-  readonly sampleRate?: number;
+  readonly enabled: boolean; readonly sampleRate?: number;
   readonly track?: {
-    readonly actorLifetimes?: boolean;
-    readonly startTimes?: boolean;
-    readonly processLifetimes?: boolean;
-    readonly lockAcquisitionTimes?: boolean;
-    readonly messageLatency?: boolean;
-    readonly bufferUtilization?: boolean;
-    readonly heartbeatIntervals?: boolean;
-    readonly resourceCallLatency?: boolean;
+    readonly actorLifetimes?: boolean; readonly startTimes?: boolean;
+    readonly processLifetimes?: boolean; readonly writeQueueWait?: boolean;
+    readonly writeQueueDepth?: boolean; readonly messageLatency?: boolean;
+    readonly bufferUtilization?: boolean; readonly heartbeatIntervals?: boolean;
+    readonly resourceCallLatency?: boolean; readonly authorizationEvents?: boolean;
+    readonly inboxDepth?: boolean; readonly refCountHistory?: boolean;
   };
 };
-
-/**
- * Supervisor config — all fields required except resources/timeouts/strategy/retry/diagnostics.
- * These are the foundational settings; everything else has safe defaults or is optional.
- */
+/** Supervisor config — defaultCodec and codecs allow custom serialization beyond built-ins. */
 export type SupervisorConfig = {
-  readonly maxActors: number;
-  readonly memory: MemoryConfig;
-  readonly resources?: ResourcesConfig;
-  readonly timeouts?: TimeoutConfig;
-  readonly strategy?: SupervisionStrategy;
-  readonly retry?: RetryConfig;
+  readonly maxActors: number; readonly memory: MemoryConfig;
+  readonly resources?: ResourcesConfig; readonly timeouts?: TimeoutConfig;
+  readonly strategy?: SupervisionStrategy; readonly retry?: RetryConfig;
   readonly diagnostics?: DiagnosticsConfig;
+  readonly defaultCodec?: FmtType;
+  readonly codecs?: Record<string, { readonly encode: (data: unknown) => Uint8Array; readonly decode: (buf: Uint8Array) => unknown }>;
 };
 
-// ============================================================================
-// Actor Configuration
-// ============================================================================
-
-/**
- * Actor config — per-actor overrides for timeout and naming.
- * Optional; defaults are inherited from supervisor config if not specified.
- */
-export type ActorConfig = {
-  readonly name?: string;
-  readonly timeoutMs?: number;
-};
-
-// ============================================================================
-// Supervisor
-// ============================================================================
-
-/**
- * Supervisor — single source of truth for actor lifecycle.
- * Owns all actor refs, manages spawning/termination, and aggregates diagnostics.
- */
+/** Supervisor — owns all actor refs, manages lifecycle, aggregates diagnostics. */
 export type Supervisor = {
   readonly id: string;
   readonly spawn: (callback: ActorCallback, options?: ActorConfig) => ActorRef;
   readonly createGroup: (config: ActorGroupConfig) => ActorGroup;
   readonly terminateActor: (id: ActorId) => void;
   readonly shutdown: () => Promise<void>;
-  readonly subscribe: (fn: (msg: unknown) => void) => () => void;
+  readonly subscribe: (fn: (msg: Message) => void) => () => void;
   readonly getDiagnostics: () => Result<SupervisorDiagnostics, string>;
 };
 
-// ============================================================================
-// Diagnostics
-// ============================================================================
-
-/**
- * Actor diagnostics — metrics help debug production issues.
- * Captures lifetime, heartbeats, message count, and termination reason for observability.
- */
+/** Actor diagnostics — lifetime, heartbeats, message count, termination reason. */
 export type ActorDiagnostics = {
-  readonly id: ActorId;
-  readonly lifetimeMs: number;
-  readonly heartbeatCount: number;
-  readonly lastHeartbeatAt: number;
-  readonly messageCount: number;
-  readonly terminationReason?: string;
+  readonly id: ActorId; readonly lifetimeMs: number; readonly heartbeatCount: number;
+  readonly lastHeartbeatAt: number; readonly messageCount: number; readonly terminationReason?: string;
 };
-
-/**
- * Supervisor diagnostics — aggregate view of system health.
- * Shows active/total actors, memory pool utilization, and per-actor metrics.
- */
+/** Supervisor diagnostics — aggregate system health, memory pool, and optional detailed metrics. */
 export type SupervisorDiagnostics = {
-  readonly activeActors: number;
-  readonly totalActorsSpawned: number;
-  readonly totalActorsTerminated: number;
-  readonly memoryPool: {
-    readonly poolSize: number;
-    readonly boxesInUse: number;
-    readonly utilization: number;
-  };
+  readonly activeActors: number; readonly totalActorsSpawned: number; readonly totalActorsTerminated: number;
+  readonly memoryPool: { readonly poolSize: number; readonly boxesInUse: number; readonly utilization: number };
   readonly actors: readonly ActorDiagnostics[];
+  readonly writeQueueWait?: { readonly avgMs: number; readonly maxMs: number; readonly totalWaits: number };
+  readonly writeQueueDepth?: { readonly avgDepth: number; readonly maxDepth: number; readonly totalSamples: number };
+  readonly authorization?: { readonly granted: number; readonly denied: number };
+  readonly inboxDepth?: { readonly maxDepth: number; readonly avgDepth: number; readonly perActor: ReadonlyArray<[ActorId, number]> };
+  readonly refCounts?: { readonly avgRefCount: number; readonly maxRefCount: number; readonly samples: ReadonlyArray<{ readonly boxIndex: number; readonly refCount: number }> };
+  readonly processLifetimes?: { readonly avgMs: number; readonly maxMs: number; readonly perActor: ReadonlyArray<[ActorId, number]> };
 };
 
-// ============================================================================
-// Internal Types
-// ============================================================================
-
-/** Worker initialization payload */
+// Worker control messages
+/** Worker init payload — sent once when worker thread starts. */
 export type WorkerInitPayload = {
-  readonly type: "INIT";
-  readonly callback: string;
-  readonly config: Pick<SupervisorConfig, "memory" | "timeouts">;
-  readonly actorId: ActorId;
+  readonly type: "INIT"; readonly callback: string;
+  readonly config: Pick<SupervisorConfig, "memory" | "timeouts">; readonly actorId: ActorId;
 };
+/** Worker spawn payload — delivers initial message to actor callback. */
+export type WorkerSpawnPayload = { readonly type: "SPAWN"; readonly data: unknown };
+/** Worker control messages — lifecycle management (INIT, SPAWN, TERMINATE). */
+export type WorkerControlMessage = WorkerInitPayload | WorkerSpawnPayload | { readonly type: "TERMINATE" };
 
-/** Worker spawn payload */
-export type WorkerSpawnPayload = {
-  readonly type: "SPAWN";
-  readonly data: unknown;
-};
+// Worker → Main messages
+/** Worker sends Tier 1 signal/status message to subscribers. */
+export type WorkerSendMessage = { readonly type: "SEND"; readonly msg: string; readonly data?: unknown };
+/** Worker requests shared-memory box for Tier 2 data. `fmt` is the serialization format. */
+export type WriteRequestMessage = { readonly type: "WRITE_REQUEST"; readonly msg: string; readonly fmt: FmtType; readonly data: Uint8Array; readonly share: ShareConfig };
+/** Worker commits written data — makes box available to readers. */
+export type CommitMessage = { readonly type: "COMMIT"; readonly lock: Lock };
+/** Worker releases a read lock on a shared-memory box. */
+export type ReleaseMessage = { readonly type: "RELEASE"; readonly lock: Lock };
+/** Worker invokes a resource method on the main thread. */
+export type ResourceRequestMessage = { readonly type: "RESOURCE_REQUEST"; readonly id: string; readonly resource: string; readonly method: string; readonly args: unknown };
+/** Worker requests bi-directional link to another actor. */
+export type LinkMessage = { readonly type: "LINK"; readonly actorId: ActorId };
+/** Worker requests uni-directional monitoring of another actor. */
+export type MonitorMessage = { readonly type: "MONITOR"; readonly actorId: ActorId };
+/** Worker requests spawning a child actor. */
+export type SpawnChildMessage = { readonly type: "SPAWN_CHILD"; readonly requestId: string; readonly callback: string; readonly config?: ActorConfig };
+/** Worker requests termination of a child actor. */
+export type TerminateChildMessage = { readonly type: "TERMINATE_CHILD"; readonly childId: ActorId };
+/** Worker reports an error to the supervisor. */
+export type WorkerErrorMessage = { readonly type: "ERROR"; readonly error: string };
+/** Worker signals resource release (cleanup hook). */
+export type ResourceReleaseMessage = { readonly type: "RESOURCE_RELEASE" };
+/** Worker heartbeat — resets lease timer during CPU-intensive loops. */
+export type HeartbeatMessage = { readonly type: "HEARTBEAT" };
 
-/**
- * Worker control messages — differ from data messages (SPAWN, SEND).
- * Control messages manage worker lifecycle (INIT, TERMINATE, HEARTBEAT).
- */
-export type WorkerControlMessage =
-  | WorkerInitPayload
-  | WorkerSpawnPayload
-  | { readonly type: "TERMINATE" }
-  | { readonly type: "HEARTBEAT" };
+// Main → Worker messages
+/** Supervisor grants write lock for a shared-memory box. */
+export type WriteGrantedMessage = { readonly type: "WRITE_GRANTED"; readonly lock: Lock };
+/** Supervisor delivers a message to the worker's inbox. `fmt` is the serialization format. */
+export type InboxMessage = { readonly type: "INBOX"; readonly handle: Lock; readonly from: ActorId; readonly msg: string; readonly fmt: FmtType };
+/** Supervisor returns successful resource call result. */
+export type ResourceResponseMessage = { readonly type: "RESOURCE_RESPONSE"; readonly id: string; readonly result: unknown };
+/** Supervisor reports resource call failure. */
+export type ResourceErrorMessage = { readonly type: "RESOURCE_ERROR"; readonly id: string; readonly error: string };
+/** Supervisor confirms child actor was spawned. */
+export type ChildSpawnedMessage = { readonly type: "CHILD_SPAWNED"; readonly requestId: string; readonly childId: ActorId };
+/** Supervisor reports child actor spawn failure. */
+export type ChildSpawnErrorMessage = { readonly type: "CHILD_SPAWN_ERROR"; readonly requestId: string; readonly error: string };
 
-/** Main-to-worker resource request */
-export type ResourceRequestMessage = {
-  readonly type: "RESOURCE_REQUEST";
-  readonly id: string;
-  readonly resource: string;
-  readonly method: string;
-  readonly args: unknown;
-};
-
-/** Worker-to-main send message */
-export type WorkerSendMessage = {
-  readonly type: "SEND";
-  readonly msg: unknown;
-};
-
-/** Worker requests a lock from main thread */
-export type LockRequestMessage = {
-  readonly type: "LOCK_REQUEST";
-};
-
-/** Worker notifies main of deposit (implicit heartbeat) */
-export type DepositMessage = {
-  readonly type: "DEPOSIT";
-};
-
-/** Worker signals deposit is done */
-export type DoneMessage = {
-  readonly type: "DONE";
-  readonly lock: Lock;
-};
-
-/** Worker requests to read a READY box */
-export type ReadStartMessage = {
-  readonly type: "READ_START";
-  readonly lock: Lock;
-  readonly requestId: string;
-};
-
-/** Main thread grants read access to a box */
-export type ReadGrantedMessage = {
-  readonly type: "READ_GRANTED";
-  readonly lock: Lock;
-  readonly requestId: string;
-};
-
-/** Main thread denies read access to a box */
-export type ReadErrorMessage = {
-  readonly type: "READ_ERROR";
-  readonly lock: Lock;
-  readonly error: string;
-  readonly requestId: string;
-};
-
-/** Worker requests link to another actor */
-export type LinkMessage = {
-  readonly type: "LINK";
-  readonly actorId: ActorId;
-};
-
-/** Worker requests monitor of another actor */
-export type MonitorMessage = {
-  readonly type: "MONITOR";
-  readonly actorId: ActorId;
-};
-
-/** Main grants lock to worker */
-export type LockGrantedMessage = {
-  readonly type: "LOCK_GRANTED";
-  readonly lock: Lock;
-};
-
-/** All messages sent from worker to main thread */
+// Protocol unions
+/** All messages sent from worker to main thread. */
 export type WorkerToMainMessage =
-  | WorkerSendMessage
-  | ResourceRequestMessage
-  | LockRequestMessage
-  | DepositMessage
-  | DoneMessage
-  | ReadStartMessage
-  | LinkMessage
-  | MonitorMessage
-  | { readonly type: "HEARTBEAT" }
-  | { readonly type: "LOCK_RELEASED"; readonly boxIndex: number }
-  | { readonly type: "ERROR"; readonly error: string }
-  | { readonly type: "RESOURCE_RELEASE" }
-  | SpawnChildMessage;
-
-/** All messages sent from main thread to worker */
+  | WorkerSendMessage | WriteRequestMessage | CommitMessage | ReleaseMessage
+  | ResourceRequestMessage | LinkMessage | MonitorMessage | SpawnChildMessage
+  | TerminateChildMessage | WorkerErrorMessage | ResourceReleaseMessage | HeartbeatMessage;
+/** All messages sent from main thread to worker. */
 export type MainToWorkerMessage =
-  | WorkerControlMessage
-  | LockGrantedMessage
-  | ReadGrantedMessage
-  | ReadErrorMessage
-  | { readonly type: "RESOURCE_RESPONSE"; readonly id: string; readonly result: unknown }
-  | { readonly type: "RESOURCE_ERROR"; readonly id: string; readonly error: string }
-  | ChildSpawnedMessage
-  | ChildSpawnErrorMessage;
+  | WorkerInitPayload | WorkerSpawnPayload | { readonly type: "TERMINATE" }
+  | WriteGrantedMessage | InboxMessage | ResourceResponseMessage | ResourceErrorMessage
+  | ChildSpawnedMessage | ChildSpawnErrorMessage | HeartbeatMessage;
 
-/** Internal actor state tracked by supervisor */
+// Internal state
+/** Internal actor state — mutable fields for lifecycle bookkeeping. */
 export type InternalActorState = {
-  readonly id: ActorId;
-  readonly worker: import("node:worker_threads").Worker;
-  readonly config: ActorConfig;
-  readonly createdAt: number;
-  heartbeats: number;
-  lastHeartbeatAt: number;
-  messagesSent: number;
-  readonly subscribers: Set<(msg: unknown) => void>;
-  readonly locks: Set<number>;
-  readonly reads: Set<number>;
-  readonly linkedActors: Set<ActorId>;
-  readonly monitoredActors: Set<ActorId>;
-  terminated: boolean;
-  terminationReason?: string;
+  readonly id: ActorId; readonly worker: import("node:worker_threads").Worker;
+  readonly config: ActorConfig; readonly createdAt: number;
+  heartbeats: number; lastHeartbeatAt: number; messagesSent: number;
+  readonly subscribers: Set<(msg: Message) => void>;
+  readonly linkedActors: Set<ActorId>; readonly monitoredActors: Set<ActorId>;
+  terminated: boolean; terminationReason?: string;
 };
-
-/** Pending resource request */
+/** Pending resource request — bridges async worker request to main-thread handler. */
 export type PendingResourceRequest = {
-  readonly resolve: (value: unknown) => void;
-  readonly reject: (error: string) => void;
+  readonly resolve: (value: unknown) => void; readonly reject: (error: string) => void;
   readonly timer: ReturnType<typeof setTimeout> | null;
 };
-
-// ============================================================================
-// Group State (internal)
-// ============================================================================
-
-/** Internal group state tracked by supervisor */
+/** Internal group state tracked by supervisor. */
 export type GroupState = {
-  readonly id: string;
-  readonly config: ActorGroupConfig;
-  readonly actorIds: ActorId[];
-  /** Stored callbacks for restart */
+  readonly id: string; readonly config: ActorGroupConfig; readonly actorIds: ActorId[];
   readonly callbacks: Map<ActorId, { readonly callback: ActorCallback; readonly config?: ActorConfig }>;
-  /** Restart tracking */
   readonly restartState: { restarts: number[] };
 };
 
-// ============================================================================
-// Worker Child Spawn
-// ============================================================================
-
-/** Worker requests to spawn a child actor */
-export type SpawnChildMessage = {
-  readonly type: "SPAWN_CHILD";
-  readonly requestId: string;
-  readonly callback: string;
-  readonly config?: ActorConfig;
-};
-
-/** Main thread confirms child spawn */
-export type ChildSpawnedMessage = {
-  readonly type: "CHILD_SPAWNED";
-  readonly requestId: string;
-  readonly childId: ActorId;
-};
-
-/** Main thread reports child spawn failure */
-export type ChildSpawnErrorMessage = {
-  readonly type: "CHILD_SPAWN_ERROR";
-  readonly requestId: string;
-  readonly error: string;
-};
-
-// ============================================================================
-// Diagnostics Collector
-// ============================================================================
-
-/**
- * Diagnostics collector — abstracts metric backend for supervisor.
- * Implementations decide where metrics go (console, Prometheus, OTEL, etc.).
- */
+/** Diagnostics collector — abstracts metric backend (console, Prometheus, OTEL, etc.). */
 export type DiagnosticsCollector = {
+  /** Record actor start time for lifetime tracking */
   readonly recordActorStart: (id: ActorId) => void;
+  /** Record actor heartbeat for interval tracking */
   readonly recordActorHeartbeat: (id: ActorId) => void;
+  /** Record actor message send for latency tracking */
   readonly recordActorMessage: (id: ActorId) => void;
+  /** Record actor termination with optional reason */
   readonly recordActorTermination: (id: ActorId, reason?: string) => void;
-  readonly recordLockAcquisition: (waitMs: number) => void;
+  /** Record write queue wait time — measures how long pending writes waited */
+  readonly recordWriteQueueWait: (waitMs: number) => void;
+  /** Record current write queue depth — tracks pending write requests */
+  readonly recordWriteQueueDepth: (depth: number) => void;
+  /** Record authorization event — tracks granted vs denied reads */
+  readonly recordAuthorizationEvent: (granted: boolean) => void;
+  /** Record per-actor inbox depth — tracks inbox queue sizes */
+  readonly recordInboxDepth: (actorId: ActorId, depth: number) => void;
+  /** Record box ref count — tracks reference counts for memory boxes */
+  readonly recordRefCount: (boxIndex: number, refCount: number) => void;
+  /** Record process lifetime — tracks worker thread uptime */
+  readonly recordProcessLifetime: (actorId: ActorId, durationMs: number) => void;
+  /** Record resource call duration — measures handler execution time */
   readonly recordResourceCall: (durationMs: number) => void;
+  /** Build per-actor diagnostics snapshot from tracked data and state fallbacks */
   readonly buildActorDiagnostics: (id: ActorId, state: InternalActorState) => ActorDiagnostics;
+  /** Build supervisor-level diagnostics snapshot with aggregate metrics */
   readonly buildSupervisorDiagnostics: (options: {
-    readonly activeActors: number;
-    readonly totalSpawned: number;
-    readonly totalTerminated: number;
-    readonly poolSize: number;
-    readonly boxesInUse: number;
-    readonly actors: readonly ActorDiagnostics[];
+    readonly activeActors: number; readonly totalSpawned: number; readonly totalTerminated: number;
+    readonly poolSize: number; readonly boxesInUse: number; readonly actors: readonly ActorDiagnostics[];
   }) => SupervisorDiagnostics;
 };

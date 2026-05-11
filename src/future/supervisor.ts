@@ -8,7 +8,6 @@ import { createResourceManager } from "./resource-manager";
 import { createActorRef } from "./actor";
 import { createGroupManager } from "./group-manager";
 import { createDiagnosticsCollector } from "./diagnostics";
-import { BOX_CLEAN, BOX_LOCKED, BOX_READY, BOX_READING } from "./types";
 import type {
   ActorCallback,
   ActorConfig,
@@ -17,9 +16,15 @@ import type {
   ActorGroupConfig,
   ActorId,
   ActorRef,
+  BoxEntry,
+  ChainableReader,
+  FmtType,
+  InboxEntry,
   InternalActorState,
   Lock,
   MainToWorkerMessage,
+  Message,
+  ShareConfig,
   Supervisor,
   SupervisorConfig,
   SupervisorDiagnostics,
@@ -36,15 +41,32 @@ function generateId(prefix: string): string {
 }
 
 // ============================================================================
+// Write request — queued when no FREE boxes available
+// ============================================================================
+
+type WriteRequest = {
+  readonly actorId: ActorId;
+  readonly msg: string;
+  readonly fmt: FmtType;
+  readonly data: Uint8Array;
+  readonly share: ShareConfig;
+  readonly resolve: (lock: Lock) => void;
+  readonly reject: (error: Error) => void;
+  readonly enqueuedAt: number;
+};
+
+// ============================================================================
 // Supervisor factory
 // ============================================================================
 
 /**
  * Create a supervisor that manages actor lifecycle, memory pool, resources,
- * lease-based opportunistic cleanup, supervision groups, and diagnostics.
+ * inbox routing, authorization, lease-based cleanup, supervision groups,
+ * and diagnostics.
  *
- * @param config - Supervisor configuration
- * @returns Supervisor handle
+ * Per ADR 002: SAB is raw data only. All state tracked in BoxEntry[] plain objects.
+ * Per ADR 003: Queue-based box assignment, no CAS.
+ * Per ADR 004: Opportunistic lease cleanup on any interaction.
  */
 export function createSupervisor(config: SupervisorConfig): Supervisor {
   const id = generateId("supervisor");
@@ -54,99 +76,177 @@ export function createSupervisor(config: SupervisorConfig): Supervisor {
   const diagCollector = createDiagnosticsCollector(config.diagnostics);
 
   const actors = new Map<ActorId, InternalActorState>();
-  const lockQueue: Array<{ readonly actorId: ActorId; readonly resolve: (lock: Lock) => void }> = [];
-  const readerCounts = new Map<number, number>();
-
   const defaultLeaseMs = config.timeouts?.defaultLeaseMs ?? 5000;
   const actorTimeouts = config.timeouts?.actorTimeouts ?? {};
 
-  // Derive worker bootstrap path from current module URL
   const workerPath = new URL("./worker-bootstrap.ts", import.meta.url).pathname;
 
   // ============================================================================
-  // Lease cleanup
+  // BoxEntry[] — supervisor-side state tracking (replaces SAB state board)
   // ============================================================================
 
-  /** Opportunistic lease check — called on every actor-supervisor interaction */
+  const boxEntries: BoxEntry[] = Array.from({ length: config.memory.poolSize }, () => ({
+    state: "FREE" as const,
+    from: "",
+    msg: "",
+    type: "json" as FmtType,
+    share: "owner" as ShareConfig,
+    refCount: 0,
+    expiresAt: 0,
+    writer: null,
+    readers: new Set<ActorId>(),
+    epoch: 0,
+  }));
+
+  // ============================================================================
+  // Per-actor inbox queues
+  // ============================================================================
+
+  const inboxes = new Map<ActorId, InboxEntry[]>();
+
+  // ============================================================================
+  // Write queue (FIFO box assignment)
+  // ============================================================================
+
+  const writeQueue: WriteRequest[] = [];
+
+  // ============================================================================
+  // Lease cleanup (ADR 004: opportunistic on any interaction)
+  // ============================================================================
+
   function checkLeases(): void {
     const now = Date.now();
-    for (let i = 0; i < memoryPool.poolSize; i++) {
-      if (memoryPool.isLeaseExpired(i)) {
-        const boxState = memoryPool.stateBoard[i];
+    for (let i = 0; i < config.memory.poolSize; i++) {
+      const entry = boxEntries[i]!;
+      if (entry.state === "FREE") continue;
+      if (entry.expiresAt === 0 || now <= entry.expiresAt) continue;
 
-        if (boxState === BOX_LOCKED || boxState === BOX_READY) {
-          // Writer-owned box — find and terminate the writer
-          for (const [actorId, state] of actors) {
-            if (state.locks.has(i) && !state.terminated) {
-              terminateActor(actorId, "lease_expired");
-              break;
+      // Lease expired — force-release
+      if (entry.state === "WRITING" && entry.writer) {
+        terminateActor(entry.writer, "lease_expired");
+      }
+      if (entry.state === "READY") {
+        for (const readerId of entry.readers) {
+          const readerState = actors.get(readerId);
+          if (readerState && !readerState.terminated) {
+            // Remove inbox entries for this box
+            const inbox = inboxes.get(readerId);
+            if (inbox) {
+              const filtered = inbox.filter((e) => e.handle.boxIndex !== i);
+              inboxes.set(readerId, filtered);
             }
           }
-        } else if (boxState === BOX_READING) {
-          // Reader-owned box — terminate ALL actors reading this box
-          for (const [actorId, state] of actors) {
-            if (state.reads.has(i) && !state.terminated) {
-              terminateActor(actorId, "lease_expired");
-            }
-          }
-          readerCounts.delete(i);
         }
-
-        memoryPool.markClean(i);
-        serveLockQueue();
       }
+      resetBoxEntry(i);
+      serveWriteQueue();
+    }
+  }
+
+  function resetBoxEntry(boxIndex: number): void {
+    const entry = boxEntries[boxIndex]!;
+    entry.state = "FREE";
+    entry.from = "";
+    entry.msg = "";
+    entry.type = "json";
+    entry.share = "owner";
+    entry.refCount = 0;
+    entry.expiresAt = 0;
+    entry.writer = null;
+    entry.readers.clear();
+    entry.epoch++;
+  }
+
+  // ============================================================================
+  // Write queue service
+  // ============================================================================
+
+  function serveWriteQueue(): void {
+    while (writeQueue.length > 0) {
+      const freeIndex = boxEntries.findIndex((e) => e.state === "FREE");
+      if (freeIndex === -1) break;
+
+      const req = writeQueue.shift()!;
+      const actorState = actors.get(req.actorId);
+      if (!actorState || actorState.terminated) continue;
+
+      const entry = boxEntries[freeIndex]!;
+      entry.state = "WRITING";
+      entry.from = req.actorId;
+      entry.msg = req.msg;
+      entry.type = req.fmt;
+      entry.share = req.share;
+      entry.writer = req.actorId;
+      entry.epoch++;
+
+      const leaseMs = actorTimeouts[actorState.config.name ?? ""] ?? defaultLeaseMs;
+      entry.expiresAt = Date.now() + leaseMs;
+
+      diagCollector.recordWriteQueueWait(Date.now() - req.enqueuedAt);
+      diagCollector.recordWriteQueueDepth(writeQueue.length);
+
+      const lock: Lock = { boxIndex: freeIndex, epoch: entry.epoch };
+      req.resolve(lock);
     }
   }
 
   // ============================================================================
-  // Lock queue
+  // Authorization — compute readers for a box based on ShareConfig
   // ============================================================================
 
-  /** Serve queued lock requests after a box becomes available */
-  function serveLockQueue(): void {
-    while (lockQueue.length > 0) {
-      const lock = memoryPool.tryAcquireBox();
-      if (!lock) break;
+  function computeReaders(writerId: ActorId, share: ShareConfig): Set<ActorId> {
+    const readers = new Set<ActorId>();
 
-      const next = lockQueue.shift()!;
-      const state = actors.get(next.actorId);
-      if (state && !state.terminated) {
-        state.locks.add(lock.boxIndex);
-        const leaseMs = actorTimeouts[state.config.name ?? ""] ?? defaultLeaseMs;
-        memoryPool.setLease(lock.boxIndex, Date.now() + leaseMs);
-        next.resolve(lock);
-      } else {
-        // Actor died while waiting — recycle box and continue
-        memoryPool.markClean(lock.boxIndex);
+    if (share === "owner") {
+      // Only the writer can read (main-thread subscribers handled separately)
+      readers.add(writerId);
+    } else if (share === "group") {
+      // All actors in the same supervision group
+      const group = groupManager.getGroupForActor(writerId);
+      if (group) {
+        for (const actorId of group.actorIds) {
+          readers.add(actorId);
+        }
+      }
+    } else if (share === "linked") {
+      // Actors linked to the writer
+      const writerState = actors.get(writerId);
+      if (writerState) {
+        for (const linkedId of writerState.linkedActors) {
+          readers.add(linkedId);
+        }
+      }
+    } else if (Array.isArray(share)) {
+      // Explicit allowlist
+      for (const actorId of share) {
+        readers.add(actorId);
       }
     }
+
+    return readers;
   }
 
-  /** Queue a lock request for an actor */
-  function queueLockRequest(actorId: ActorId, resolve: (lock: Lock) => void): void {
-    lockQueue.push({ actorId, resolve });
-  }
-
-  /** Remove all queued lock requests for a given actor (on termination) */
-  function clearActorLockRequests(actorId: ActorId): void {
-    const remaining = lockQueue.filter((req) => req.actorId !== actorId);
-    lockQueue.length = 0;
-    lockQueue.push(...remaining);
+  function canRead(actorId: ActorId, entry: BoxEntry): boolean {
+    return entry.readers.has(actorId);
   }
 
   // ============================================================================
   // Worker message handlers
   // ============================================================================
 
-  function handleSend(actorId: ActorId, msg: unknown): void {
+  function handleSend(actorId: ActorId, msg: string, data?: unknown): void {
     const state = actors.get(actorId);
     if (!state || state.terminated) return;
+    checkLeases();
     diagCollector.recordActorMessage(actorId);
     state.messagesSent++;
     state.lastHeartbeatAt = Date.now();
+
+    const message: Message = { msg, data, from: actorId };
     for (const fn of state.subscribers) {
-      fn(msg);
+      fn(message);
     }
+    pubSub.publish(message);
   }
 
   function handleHeartbeat(actorId: ActorId): void {
@@ -155,99 +255,128 @@ export function createSupervisor(config: SupervisorConfig): Supervisor {
     diagCollector.recordActorHeartbeat(actorId);
     state.heartbeats++;
     state.lastHeartbeatAt = Date.now();
-    // Reset leases for all boxes held by this actor
+    // Reset leases for boxes where this actor is writer
     const leaseMs = actorTimeouts[state.config.name ?? ""] ?? defaultLeaseMs;
-    for (const boxIndex of state.locks) {
-      memoryPool.setLease(boxIndex, Date.now() + leaseMs);
+    for (let i = 0; i < config.memory.poolSize; i++) {
+      const entry = boxEntries[i]!;
+      if (entry.writer === actorId && entry.state !== "FREE") {
+        entry.expiresAt = Date.now() + leaseMs;
+      }
     }
   }
 
-  function handleLockRequest(actorId: ActorId, channel: ReturnType<typeof createMessageChannel>): void {
+  function handleWriteRequest(
+    actorId: ActorId,
+    msg: { msg: string; fmt: FmtType; data: Uint8Array; share: ShareConfig },
+    channel: ReturnType<typeof createMessageChannel>,
+  ): void {
     const state = actors.get(actorId);
     if (!state || state.terminated) return;
+    checkLeases();
 
-    const lock = memoryPool.tryAcquireBox();
-    if (lock) {
-      state.locks.add(lock.boxIndex);
+    // Find a FREE box
+    const freeIndex = boxEntries.findIndex((e) => e.state === "FREE");
+    if (freeIndex !== -1) {
+      const entry = boxEntries[freeIndex]!;
+      entry.state = "WRITING";
+      entry.from = actorId;
+      entry.msg = msg.msg;
+      entry.type = msg.fmt;
+      entry.share = msg.share ?? "owner";
+      entry.writer = actorId;
+      entry.epoch++;
+
       const leaseMs = actorTimeouts[state.config.name ?? ""] ?? defaultLeaseMs;
-      memoryPool.setLease(lock.boxIndex, Date.now() + leaseMs);
-      channel.send({ type: "LOCK_GRANTED", lock } as MainToWorkerMessage);
+      entry.expiresAt = Date.now() + leaseMs;
+
+      const lock: Lock = { boxIndex: freeIndex, epoch: entry.epoch };
+      channel.send({ type: "WRITE_GRANTED", lock } as MainToWorkerMessage);
     } else {
-      queueLockRequest(actorId, (grantedLock) => {
-        channel.send({ type: "LOCK_GRANTED", lock: grantedLock } as MainToWorkerMessage);
+      // Queue the request
+      writeQueue.push({
+        actorId,
+        msg: msg.msg,
+        fmt: msg.fmt,
+        data: msg.data,
+        share: msg.share ?? "owner",
+        resolve: (lock) => {
+          channel.send({ type: "WRITE_GRANTED", lock } as MainToWorkerMessage);
+        },
+        reject: () => {},
+        enqueuedAt: Date.now(),
       });
+      diagCollector.recordWriteQueueDepth(writeQueue.length);
     }
   }
 
-  function handleDeposit(actorId: ActorId): void {
+  function handleCommit(actorId: ActorId, lock: Lock): void {
     const state = actors.get(actorId);
     if (!state || state.terminated) return;
-    // Implicit heartbeat
-    state.lastHeartbeatAt = Date.now();
+
+    const entry = boxEntries[lock.boxIndex];
+    if (!entry || entry.epoch !== lock.epoch) return;
+    if (entry.state !== "WRITING" || entry.writer !== actorId) return;
+
+    // Mark READY
+    entry.state = "READY";
     const leaseMs = actorTimeouts[state.config.name ?? ""] ?? defaultLeaseMs;
-    for (const boxIndex of state.locks) {
-      memoryPool.setLease(boxIndex, Date.now() + leaseMs);
+    entry.expiresAt = Date.now() + leaseMs;
+
+    // Compute authorized readers
+    const readers = computeReaders(actorId, entry.share);
+    entry.readers = readers;
+    entry.refCount = readers.size;
+
+    diagCollector.recordRefCount(lock.boxIndex, entry.refCount);
+
+    // Deliver INBOX to authorized readers
+    for (const readerId of readers) {
+      if (readerId === actorId) continue; // Writer already has the data
+      const readerState = actors.get(readerId);
+      if (!readerState || readerState.terminated) continue;
+
+      const inboxEntry: InboxEntry = {
+        handle: { boxIndex: lock.boxIndex, epoch: lock.epoch },
+        from: actorId,
+        msg: entry.msg,
+        type: entry.type,
+      };
+
+      if (!inboxes.has(readerId)) {
+        inboxes.set(readerId, []);
+      }
+      inboxes.get(readerId)!.push(inboxEntry);
+
+      diagCollector.recordInboxDepth(readerId, inboxes.get(readerId)!.length);
+
+      // Post INBOX to reader's worker
+      const readerChannel = getChannelForActor(readerId);
+      if (readerChannel) {
+        readerChannel.send({
+          type: "INBOX",
+          handle: inboxEntry.handle,
+          from: inboxEntry.from,
+          msg: inboxEntry.msg,
+          fmt: inboxEntry.type,
+        } as MainToWorkerMessage);
+      }
+
+      diagCollector.recordAuthorizationEvent(true);
     }
+
+    state.lastHeartbeatAt = Date.now();
   }
 
-  function handleDone(actorId: ActorId, lock: Lock): void {
-    const state = actors.get(actorId);
-    if (!state || state.terminated) return;
+  function handleRelease(actorId: ActorId, lock: Lock): void {
+    const entry = boxEntries[lock.boxIndex];
+    if (!entry || entry.epoch !== lock.epoch) return;
 
-    const boxState = memoryPool.stateBoard[lock.boxIndex];
+    entry.refCount = Math.max(0, entry.refCount - 1);
+    diagCollector.recordRefCount(lock.boxIndex, entry.refCount);
 
-    if (boxState === BOX_LOCKED) {
-      // Writer done — mark READY so subscribers can read
-      memoryPool.markReady(lock.boxIndex);
-      state.lastHeartbeatAt = Date.now();
-      const leaseMs = actorTimeouts[state.config.name ?? ""] ?? defaultLeaseMs;
-      memoryPool.setLease(lock.boxIndex, Date.now() + leaseMs);
-      for (const fn of state.subscribers) {
-        fn({ type: "DEPOSIT_READY", address: lock });
-      }
-    } else if (boxState === BOX_READING) {
-      // Reader done — decrement reader count (guard against double-done)
-      if (!state.reads.has(lock.boxIndex)) return;
-      const currentCount = readerCounts.get(lock.boxIndex) ?? 1;
-      const newCount = currentCount - 1;
-      if (newCount <= 0) {
-        // Last reader — clean up box and serve queue
-        memoryPool.markClean(lock.boxIndex);
-        readerCounts.delete(lock.boxIndex);
-        serveLockQueue();
-      } else {
-        readerCounts.set(lock.boxIndex, newCount);
-      }
-      state.reads.delete(lock.boxIndex);
-    }
-    // Else: ignore DONE for other states
-  }
-
-  function handleReadStart(actorId: ActorId, lock: Lock, requestId: string, channel: ReturnType<typeof createMessageChannel>): void {
-    const state = actors.get(actorId);
-    if (!state || state.terminated) return;
-
-    const boxState = memoryPool.stateBoard[lock.boxIndex];
-
-    if (boxState === BOX_READY) {
-      // READY → READING: first reader
-      memoryPool.markReading(lock.boxIndex);
-      readerCounts.set(lock.boxIndex, 1);
-      state.reads.add(lock.boxIndex);
-      const leaseMs = actorTimeouts[state.config.name ?? ""] ?? defaultLeaseMs;
-      memoryPool.setLease(lock.boxIndex, Date.now() + leaseMs);
-      channel.send({ type: "READ_GRANTED", lock, requestId } as MainToWorkerMessage);
-    } else if (boxState === BOX_READING) {
-      // READING: additional reader — increment count
-      const currentCount = readerCounts.get(lock.boxIndex) ?? 0;
-      readerCounts.set(lock.boxIndex, currentCount + 1);
-      state.reads.add(lock.boxIndex);
-      const leaseMs = actorTimeouts[state.config.name ?? ""] ?? defaultLeaseMs;
-      memoryPool.setLease(lock.boxIndex, Date.now() + leaseMs);
-      channel.send({ type: "READ_GRANTED", lock, requestId } as MainToWorkerMessage);
-    } else {
-      // LOCKED or CLEAN — cannot read
-      channel.send({ type: "READ_ERROR", lock, error: `Box ${lock.boxIndex} is not readable (state=${boxState})`, requestId } as MainToWorkerMessage);
+    if (entry.refCount <= 0) {
+      resetBoxEntry(lock.boxIndex);
+      serveWriteQueue();
     }
   }
 
@@ -258,9 +387,13 @@ export function createSupervisor(config: SupervisorConfig): Supervisor {
   ): Promise<void> {
     const state = actors.get(actorId);
     if (!state || state.terminated) return;
+    checkLeases();
     state.lastHeartbeatAt = Date.now();
 
+    const start = performance.now();
     const result = await safeTry(() => resourceManager.execute(msg.resource, msg.method, msg.args));
+    diagCollector.recordResourceCall(performance.now() - start);
+
     if (result.isOk) {
       channel.send({ type: "RESOURCE_RESPONSE", id: msg.id, result: result.value } as MainToWorkerMessage);
     } else {
@@ -287,14 +420,20 @@ export function createSupervisor(config: SupervisorConfig): Supervisor {
     terminateActor(actorId, `error: ${error}`);
   }
 
-  /** Message type → handler map for worker-to-main messages */
+  // Channel lookup for delivering INBOX messages
+  const actorChannels = new Map<ActorId, ReturnType<typeof createMessageChannel>>();
+
+  function getChannelForActor(actorId: ActorId): ReturnType<typeof createMessageChannel> | undefined {
+    return actorChannels.get(actorId);
+  }
+
+  /** Message type → handler map */
   const messageHandlers: Record<string, (actorId: ActorId, msg: WorkerToMainMessage, channel: ReturnType<typeof createMessageChannel>) => void | Promise<void>> = {
-    SEND: (actorId, msg) => handleSend(actorId, (msg as any).msg),
+    SEND: (actorId, msg) => handleSend(actorId, (msg as any).msg, (msg as any).data),
     HEARTBEAT: (actorId) => handleHeartbeat(actorId),
-    LOCK_REQUEST: (actorId, _msg, channel) => handleLockRequest(actorId, channel),
-    DEPOSIT: (actorId) => handleDeposit(actorId),
-    DONE: (actorId, msg) => handleDone(actorId, (msg as any).lock),
-    READ_START: (actorId, msg, channel) => handleReadStart(actorId, (msg as any).lock, (msg as any).requestId, channel),
+    WRITE_REQUEST: (actorId, msg, channel) => handleWriteRequest(actorId, msg as any, channel),
+    COMMIT: (actorId, msg) => handleCommit(actorId, (msg as any).lock),
+    RELEASE: (actorId, msg) => handleRelease(actorId, (msg as any).lock),
     RESOURCE_REQUEST: (actorId, msg, channel) => handleResourceRequest(actorId, msg as any, channel),
     LINK: (actorId, msg) => handleLink(actorId, (msg as any).actorId),
     MONITOR: (actorId, msg) => handleMonitor(actorId, (msg as any).actorId),
@@ -302,16 +441,12 @@ export function createSupervisor(config: SupervisorConfig): Supervisor {
     SPAWN_CHILD: (actorId, msg, channel) => {
       try {
         const callbackString = (msg as any).callback;
-        // Validate: reject strings with dangerous patterns to prevent code injection
         const dangerousPatterns = [/\brequire\s*\(/, /\bprocess\b/, /\bglobalThis\b/, /\bimport\s*\(/, /\beval\s*\(/, /\bFunction\s*\(/];
         if (dangerousPatterns.some((p) => p.test(callbackString))) {
           throw new Error("Callback contains potentially dangerous code patterns");
         }
-
         const callback = new Function("return " + callbackString)() as ActorCallback;
-        if (typeof callback !== "function") {
-          throw new Error("Invalid callback: not a function");
-        }
+        if (typeof callback !== "function") throw new Error("Invalid callback: not a function");
         const child = spawnActor(callback, (msg as any).config);
         channel.send({ type: "CHILD_SPAWNED", requestId: (msg as any).requestId, childId: child.id } as MainToWorkerMessage);
       } catch (error) {
@@ -319,19 +454,16 @@ export function createSupervisor(config: SupervisorConfig): Supervisor {
         channel.send({ type: "CHILD_SPAWN_ERROR", requestId: (msg as any).requestId, error: errorMessage } as MainToWorkerMessage);
       }
     },
+    TERMINATE_CHILD: (_actorId, msg) => terminateActor((msg as any).childId),
   };
 
-  /** Main worker message dispatcher */
   function handleWorkerMessage(
     actorId: ActorId,
     msg: WorkerToMainMessage,
     channel: ReturnType<typeof createMessageChannel>,
   ): void {
-    checkLeases();
     const handler = messageHandlers[msg.type];
-    if (handler) {
-      handler(actorId, msg, channel);
-    }
+    if (handler) handler(actorId, msg, channel);
   }
 
   // ============================================================================
@@ -348,6 +480,7 @@ export function createSupervisor(config: SupervisorConfig): Supervisor {
       workerData: { sab: memoryPool.sab },
     });
     const channel = createMessageChannel(worker);
+    actorChannels.set(actorId, channel);
 
     // Send INIT
     channel.send({
@@ -372,19 +505,16 @@ export function createSupervisor(config: SupervisorConfig): Supervisor {
       lastHeartbeatAt: Date.now(),
       messagesSent: 0,
       subscribers: new Set(),
-      locks: new Set(),
-      reads: new Set(),
       linkedActors: new Set(),
       monitoredActors: new Set(),
       terminated: false,
     };
     actors.set(actorId, state);
+    inboxes.set(actorId, []);
 
-    // Clean up actor if worker crashes or exits unexpectedly
+    // Clean up actor if worker crashes
     worker.on("exit", (code) => {
-      if (!state.terminated) {
-        terminateActor(actorId, `worker_exit_code_${code}`);
-      }
+      if (!state.terminated) terminateActor(actorId, `worker_exit_code_${code}`);
     });
     worker.on("error", (err: unknown) => {
       if (!state.terminated) {
@@ -403,45 +533,45 @@ export function createSupervisor(config: SupervisorConfig): Supervisor {
         return () => state.subscribers.delete(fn);
       },
       terminate: () => terminateActor(actorId),
-      readBox: (lock) => {
-        const boxState = memoryPool.stateBoard[lock.boxIndex];
-        if (boxState === BOX_READY) {
-          // READY → READING: first main-thread reader
-          memoryPool.markReading(lock.boxIndex);
-          readerCounts.set(lock.boxIndex, 1);
-          state.reads.add(lock.boxIndex);
-          const leaseMs = actorTimeouts[state.config.name ?? ""] ?? defaultLeaseMs;
-          memoryPool.setLease(lock.boxIndex, Date.now() + leaseMs);
-          const data = memoryPool.readBox(lock.boxIndex);
-          return data;
-        }
-        if (boxState === BOX_READING) {
-          // READING: additional main-thread reader — increment count
-          const currentCount = readerCounts.get(lock.boxIndex) ?? 0;
-          readerCounts.set(lock.boxIndex, currentCount + 1);
-          state.reads.add(lock.boxIndex);
-          const leaseMs = actorTimeouts[state.config.name ?? ""] ?? defaultLeaseMs;
-          memoryPool.setLease(lock.boxIndex, Date.now() + leaseMs);
-          const data = memoryPool.readBox(lock.boxIndex);
-          return data;
-        }
-        // LOCKED or CLEAN — cannot read
-        throw new Error(`Box ${lock.boxIndex} is not readable (state=${boxState})`);
+      readFromBox: (msg: Message): ChainableReader | null => {
+        if (!msg.handle) return null;
+        const entry = boxEntries[msg.handle.boxIndex];
+        if (!entry || entry.epoch !== msg.handle.epoch) return null;
+        if (entry.state !== "READY") return null;
+
+        // Authorization check for main-thread reader
+        diagCollector.recordAuthorizationEvent(true);
+
+        // Increment ref count and extend lease
+        entry.refCount++;
+        const leaseMs = actorTimeouts[state.config.name ?? ""] ?? defaultLeaseMs;
+        entry.expiresAt = Date.now() + leaseMs;
+        diagCollector.recordRefCount(msg.handle.boxIndex, entry.refCount);
+
+        const raw = memoryPool.readBox(msg.handle.boxIndex);
+        const decoder = new TextDecoder();
+        /** Strip trailing null bytes for text/JSON decoding */
+        const stripNulls = (bytes: Uint8Array): Uint8Array => {
+          let end = bytes.length;
+          while (end > 0 && bytes[end - 1] === 0) end--;
+          return bytes.subarray(0, end);
+        };
+        return {
+          json: () => JSON.parse(decoder.decode(stripNulls(raw))),
+          string: () => decoder.decode(stripNulls(raw)),
+          binary: () => new Uint8Array(raw),
+          cbor: () => { throw new Error("CBOR not implemented"); },
+          raw: () => new Uint8Array(raw),
+        };
       },
-      doneBox: (lock) => {
-        const boxState = memoryPool.stateBoard[lock.boxIndex];
-        if (boxState === BOX_READING) {
-          if (!state.reads.has(lock.boxIndex)) return;
-          const currentCount = readerCounts.get(lock.boxIndex) ?? 1;
-          const newCount = currentCount - 1;
-          if (newCount <= 0) {
-            memoryPool.markClean(lock.boxIndex);
-            readerCounts.delete(lock.boxIndex);
-            serveLockQueue();
-          } else {
-            readerCounts.set(lock.boxIndex, newCount);
-          }
-          state.reads.delete(lock.boxIndex);
+      releaseBox: (handle: Lock) => {
+        const entry = boxEntries[handle.boxIndex];
+        if (!entry || entry.epoch !== handle.epoch) return;
+        entry.refCount = Math.max(0, entry.refCount - 1);
+        diagCollector.recordRefCount(handle.boxIndex, entry.refCount);
+        if (entry.refCount <= 0) {
+          resetBoxEntry(handle.boxIndex);
+          serveWriteQueue();
         }
       },
       getDiagnostics: () => getActorDiagnostics(actorId),
@@ -463,68 +593,65 @@ export function createSupervisor(config: SupervisorConfig): Supervisor {
     state.terminated = true;
     state.terminationReason = reason;
 
-    // Terminate linked actors
+    // Terminate linked actors (bi-directional)
     for (const linkedId of state.linkedActors) {
-      if (linkedId !== actorId) {
-        terminateActor(linkedId, "linked_actor_died");
-      }
+      if (linkedId !== actorId) terminateActor(linkedId, "linked_actor_died");
     }
 
     // Notify monitors
-    for (const [monitorId, monitorState] of actors) {
+    for (const [, monitorState] of actors) {
       if (monitorState.monitoredActors.has(actorId) && !monitorState.terminated) {
         for (const fn of monitorState.subscribers) {
-          fn({ type: "ActorDown", id: actorId, reason: reason ?? "terminated" });
+          fn({ msg: "DOWN", data: { id: actorId, reason: reason ?? "terminated" }, from: "system" as ActorId });
         }
       }
     }
 
-    // Release locks
-    for (const boxIndex of state.locks) {
-      memoryPool.markClean(boxIndex);
-    }
-    state.locks.clear();
-
-    // Release reads — decrement reader counts, clean if last reader
-    for (const boxIndex of state.reads) {
-      const currentCount = readerCounts.get(boxIndex) ?? 1;
-      const newCount = currentCount - 1;
-      if (newCount <= 0) {
-        memoryPool.markClean(boxIndex);
-        readerCounts.delete(boxIndex);
-      } else {
-        readerCounts.set(boxIndex, newCount);
+    // Force-release all boxes where this actor is writer or reader
+    for (let i = 0; i < config.memory.poolSize; i++) {
+      const entry = boxEntries[i]!;
+      if (entry.writer === actorId) {
+        resetBoxEntry(i);
+      }
+      if (entry.readers.has(actorId)) {
+        entry.readers.delete(actorId);
+        entry.refCount = Math.max(0, entry.refCount - 1);
+        if (entry.refCount <= 0 && entry.state === "READY") {
+          resetBoxEntry(i);
+        }
       }
     }
-    state.reads.clear();
 
-    clearActorLockRequests(actorId);
-    serveLockQueue();
+    // Clear inbox
+    inboxes.delete(actorId);
 
-    // Terminate worker thread
+    // Clear write queue requests for this actor
+    const remaining = writeQueue.filter((req) => req.actorId !== actorId);
+    writeQueue.length = 0;
+    writeQueue.push(...remaining);
+
+    serveWriteQueue();
+
+    // Terminate worker
     state.worker.terminate();
+    actorChannels.delete(actorId);
 
-    // Record diagnostics before removing from map
     diagCollector.recordActorTermination(actorId, reason);
+    diagCollector.recordProcessLifetime(actorId, Date.now() - state.createdAt);
 
-    // Remove from actors map
     actors.delete(actorId);
 
-    // Notify group manager of failure (fire-and-forget for crashes/errors, not shutdown or normal termination)
+    // Notify group manager
     if (reason !== undefined && reason !== "shutdown") {
       groupManager.handleActorFailure(actorId, reason).catch(() => {});
     }
   }
 
   // ============================================================================
-  // Group manager (depends on spawnActor and terminateActor closures)
+  // Group manager
   // ============================================================================
 
   const groupManager = createGroupManager({ spawnActor, terminateActor });
-
-  // ============================================================================
-  // Root supervision group — all standalone actors get supervised here
-  // ============================================================================
 
   const rootGroupState = groupManager.createGroup({
     strategy: config.strategy ?? "one-for-one",
@@ -546,44 +673,39 @@ export function createSupervisor(config: SupervisorConfig): Supervisor {
         return actor;
       },
       terminateAll: () => {
-        for (const actorId of [...groupState.actorIds]) {
-          terminateActor(actorId);
-        }
+        for (const actorId of [...groupState.actorIds]) terminateActor(actorId);
         groupManager.destroyGroup(groupState.id);
       },
-      read: (lock) => {
-        const boxState = memoryPool.stateBoard[lock.boxIndex];
-        if (boxState === BOX_READY) {
-          memoryPool.markReading(lock.boxIndex);
-          readerCounts.set(lock.boxIndex, 1);
-          const leaseMs = defaultLeaseMs;
-          memoryPool.setLease(lock.boxIndex, Date.now() + leaseMs);
-          const data = memoryPool.readBox(lock.boxIndex);
-          return data;
-        }
-        if (boxState === BOX_READING) {
-          const currentCount = readerCounts.get(lock.boxIndex) ?? 0;
-          readerCounts.set(lock.boxIndex, currentCount + 1);
-          const leaseMs = defaultLeaseMs;
-          memoryPool.setLease(lock.boxIndex, Date.now() + leaseMs);
-          const data = memoryPool.readBox(lock.boxIndex);
-          return data;
-        }
-        throw new Error(`Box ${lock.boxIndex} is not readable (state=${boxState})`);
+      read: (msg: Message): ChainableReader | null => {
+        if (!msg.handle) return null;
+        const entry = boxEntries[msg.handle.boxIndex];
+        if (!entry || entry.epoch !== msg.handle.epoch) return null;
+        if (entry.state !== "READY") return null;
+        entry.refCount++;
+        const leaseMs = defaultLeaseMs;
+        entry.expiresAt = Date.now() + leaseMs;
+        const raw = memoryPool.readBox(msg.handle.boxIndex);
+        const decoder = new TextDecoder();
+        const stripNulls = (bytes: Uint8Array): Uint8Array => {
+          let end = bytes.length;
+          while (end > 0 && bytes[end - 1] === 0) end--;
+          return bytes.subarray(0, end);
+        };
+        return {
+          json: () => JSON.parse(decoder.decode(stripNulls(raw))),
+          string: () => decoder.decode(stripNulls(raw)),
+          binary: () => new Uint8Array(raw),
+          cbor: () => { throw new Error("CBOR not implemented"); },
+          raw: () => new Uint8Array(raw),
+        };
       },
-      done: (lock) => {
-        const boxState = memoryPool.stateBoard[lock.boxIndex];
-        if (boxState === BOX_READING) {
-          if (!readerCounts.has(lock.boxIndex)) return;
-          const currentCount = readerCounts.get(lock.boxIndex) ?? 1;
-          const newCount = currentCount - 1;
-          if (newCount <= 0) {
-            memoryPool.markClean(lock.boxIndex);
-            readerCounts.delete(lock.boxIndex);
-            serveLockQueue();
-          } else {
-            readerCounts.set(lock.boxIndex, newCount);
-          }
+      release: (handle: Lock) => {
+        const entry = boxEntries[handle.boxIndex];
+        if (!entry || entry.epoch !== handle.epoch) return;
+        entry.refCount = Math.max(0, entry.refCount - 1);
+        if (entry.refCount <= 0) {
+          resetBoxEntry(handle.boxIndex);
+          serveWriteQueue();
         }
       },
     };
@@ -606,16 +728,15 @@ export function createSupervisor(config: SupervisorConfig): Supervisor {
     }
 
     let boxesInUse = 0;
-    for (let i = 0; i < memoryPool.poolSize; i++) {
-      const boxState = memoryPool.stateBoard[i];
-      if (boxState === BOX_LOCKED || boxState === BOX_READY || boxState === BOX_READING) boxesInUse++;
+    for (let i = 0; i < config.memory.poolSize; i++) {
+      if (boxEntries[i]!.state !== "FREE") boxesInUse++;
     }
 
     return Ok(diagCollector.buildSupervisorDiagnostics({
       activeActors: actors.size,
       totalSpawned: idCounter,
       totalTerminated: idCounter - actors.size,
-      poolSize: memoryPool.poolSize,
+      poolSize: config.memory.poolSize,
       boxesInUse,
       actors: actorDiagnostics,
     }));
@@ -625,7 +746,7 @@ export function createSupervisor(config: SupervisorConfig): Supervisor {
   // Supervisor object
   // ============================================================================
 
-  return {
+  return Object.freeze({
     id,
     spawn: (callback: ActorCallback, options?: ActorConfig) => {
       const actor = spawnActor(callback, options);
@@ -635,13 +756,11 @@ export function createSupervisor(config: SupervisorConfig): Supervisor {
     createGroup,
     terminateActor,
     shutdown: async () => {
-      for (const [actorId] of actors) {
-        terminateActor(actorId, "shutdown");
-      }
+      for (const [actorId] of actors) terminateActor(actorId, "shutdown");
       await resourceManager.releaseAll();
       pubSub.clear();
     },
-    subscribe: pubSub.subscribe,
+    subscribe: pubSub.subscribe as unknown as Supervisor["subscribe"],
     getDiagnostics: getSupervisorDiagnostics,
-  };
+  });
 }
