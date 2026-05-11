@@ -1,6 +1,6 @@
 # Future
 
-High-performance system-level actor and promise primitives for Bun and Node.js inspired by Erlang.
+High-performance system-level actor and promise primitives for **Bun** inspired by Erlang.
 
 ## Install
 
@@ -8,12 +8,14 @@ High-performance system-level actor and promise primitives for Bun and Node.js i
 npm install @nilejs/future
 ```
 
-Requirements: Bun v1.0+ or Node.js v18+, TypeScript v4.5+ (for full type safety)
+**Requirements: Bun v1.0+**, TypeScript v4.5+ (for full type safety)
+
+> **Note:** `@nilejs/future` is designed exclusively for the **Bun runtime**. While the underlying APIs (`worker_threads`, `SharedArrayBuffer`) exist in Node.js, the library relies on Bun's native TypeScript support and worker thread resolution for actor callback serialization. Node.js support is not currently available but may be explored in future releases.
 
 ## Quick Example
 
 ```typescript
-import { createSupervisor } from "@nilejs/future";
+import { createSupervisor, matchAll, println } from "@nilejs/future";
 
 const supervisor = createSupervisor({
   maxActors: 10,
@@ -21,13 +23,14 @@ const supervisor = createSupervisor({
 });
 
 const actor = supervisor.spawn(async (self, msg, ctx) => {
-  const result = await processData(msg.input);
+  // Actor callbacks are serialized — all logic must be inline or via ctx.resources
+  const result = msg.input.toUpperCase();
   self.send({ type: 'DONE', result });
 });
 
 actor.spawn({ input: 'test' });
-actor.subscribe((msg) => match(msg, {
-  DONE: (m) => println('Result:', m.result),
+actor.subscribe((msg) => matchAll(msg, {
+  DONE: (m) => println('Result:', (m as any).result),
   _: () => {}
 }));
 ```
@@ -184,16 +187,18 @@ Supervision strategies:
 [slang-ts](https://github.com/Hussseinkizz/slang) is an external TypeScript library that provides functional patterns. All code uses slang-ts patterns for cleaner, safer code:
 
 ```typescript
-// match instead of if/switch
+import { match, matchAll, println } from "@nilejs/future";
+
+// match instead of if/switch — for Result/Option types
 match(result, {
-  Ok: (v) => process(v),
-  Err: (e) => handle(e),
+  Ok: (v) => println('Success:', v.value),
+  Err: (e) => println('Error:', e.error),
 });
 
-// matchAll for tagged unions
+// matchAll for tagged unions — for plain message objects
 matchAll(msg, {
-  PROGRESS: (m) => println(m.value),
-  ERROR: (e) => println(e.message),
+  PROGRESS: (m) => println((m as any).value),
+  ERROR: (e) => println((e as any).message),
   _: () => {}  // Default case
 });
 
@@ -212,6 +217,9 @@ This replaces imperative control flow with declarative pattern matching.
 Resources are services available to actors but running on the main thread. The Resource Manager provides safe access through intent relay.
 
 ```typescript
+import { z } from "zod";
+
+// Assume `db` is your real database client (e.g., pg, drizzle, etc.)
 const supervisor = createSupervisor({
   resources: {
     database: {
@@ -225,7 +233,7 @@ const supervisor = createSupervisor({
   }
 });
 
-// Actor uses resource
+// Inside an actor callback:
 const results = await ctx.resources.database.query({ sql: 'SELECT 1' });
 ```
 
@@ -244,26 +252,26 @@ Benefits:
 ## How It Works
 
 ```typescript
-import { createSupervisor } from "@nilejs/future";
+import { createSupervisor, matchAll, println } from "@nilejs/future";
 
 // Actor callbacks are serialized, outer scope is NOT available
 const config = { timeout: 5000 };
-const sharedData = heavyPayload;
+// const sharedData = heavyPayload;  // This will be undefined in the worker!
 
 // WRONG: outer scope is lost on serialization
-const actor = supervisor.spawn(async (self, msg, ctx) => {
+const badActor = supervisor.spawn(async (self, msg, ctx) => {
   // config === undefined
   // sharedData === undefined
 });
 
-// RIGHT: pass state via msg
+// RIGHT: pass state via msg, use inline logic or resources
 const actor = supervisor.spawn(async (self, msg, ctx) => {
   const timeout = msg.timeout;  // From message
   const data = await ctx.resources.storage.get(msg.dataId);  // From resources
 
-  // Heavy processing with heartbeat
+  // Heavy processing with heartbeat — all logic must be inline
   for (let i = 0; i < data.length; i++) {
-    process(data[i]);
+    data[i] = data[i] * 2;  // inline transform, no outer scope
     if (i % 1000 === 0) ctx.heartbeat();
   }
 
@@ -275,16 +283,11 @@ actor.spawn({ timeout: 5000, dataId: 'abc123' });
 
 // Subscribe to messages
 actor.subscribe((msg) => {
-  match(msg, {
+  matchAll(msg, {
     COMPLETE: () => println('Done'),
     _: () => {}
   });
 });
-
-// Terminate on demand - CODE STOPS IMMEDIATELY
-// This is NOT AbortController which just ignores results
-// This is TRUE termination, the thread is killed
-actor.terminate();
 ```
 
 ## Termination vs AbortController
@@ -306,9 +309,9 @@ const producer = supervisor.spawn(async (self, msg, ctx) => {
   const lock = await ctx.acquireLock();
   const buffer = ctx.fmt.alloc(msg.size);
 
-  // Write data directly to shared buffer
+  // Write data directly to shared buffer — inline computation only
   for (let i = 0; i < msg.size; i++) {
-    buffer[i] = computeValue(i);
+    buffer[i] = i % 256;
   }
 
   ctx.deposit(lock, buffer);
@@ -324,24 +327,28 @@ producer.spawn({ size: 1000000 });
 Resilient actor hierarchies:
 
 ```typescript
+import { matchAll } from "@nilejs/future";
+
 const pipeline = supervisor.createGroup({
   strategy: 'rest-for-one'  // Restart downstream on upstream failure
 });
 
+// Stage 1: Fetch data and deposit to Tier 2
 const ingest = pipeline.spawn(async (self, msg, ctx) => {
-  const data = await ctx.resources.http.get(msg.url);
+  const data = await ctx.resources.http.get({ url: msg.url });
   const lock = await ctx.acquireLock();
   ctx.deposit(lock, data);
-  ctx.done(lock);
+  ctx.done(lock);  // Marks READY, fires DEPOSIT_READY to subscribers
   self.send({ type: 'INGESTED' });
 });
 
-const transform = pipeline.spawn(async (self, msg, ctx) => {
-  match(msg, {
-    INGESTED: async () => {
-      const data = pipeline.read(msg.address);
-      const result = transformData(data);
-      self.send({ type: 'TRANSFORMED', data: result });
+// Main thread subscriber reads Tier 2 data — runs outside serialized context
+ingest.subscribe((msg) => {
+  matchAll(msg, {
+    DEPOSIT_READY: (m) => {
+      const data = ingest.read((m as any).address);  // Main thread only
+      println('Data received, size:', data.length);
+      ingest.done((m as any).address);  // Release read lock
     },
     _: () => {}
   });

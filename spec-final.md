@@ -4,7 +4,7 @@
 
 ## 1. Vision & Overview
 
-`@nilejs/future` is a high-performance, system-level actor and promise primitives for Bun and Node.js inspired by Erlang. It facilitates isolated concurrent execution using a **Two-Tier Communication** model, balancing ease of use with zero-copy data transfer.
+`@nilejs/future` is a high-performance, system-level actor and promise primitives for **Bun** inspired by Erlang. It facilitates isolated concurrent execution using a **Two-Tier Communication** model, balancing ease of use with zero-copy data transfer.
 
 ---
 
@@ -51,6 +51,30 @@
   - `ctx.fmt.string.encode/decode` - Explicit string encoding/decoding
   - `ctx.fmt.cbor.encode/decode` - CBOR encoding/decoding (if available)
 
+### ADR 006: Bun-Only Runtime Support
+
+* **Decision:** Target **Bun exclusively** as the runtime. Drop official Node.js support.
+* **Why:** 
+  - Bun has native TypeScript support without transpilation or loaders. Worker threads in Bun can directly resolve `.ts` imports, which is essential for our callback serialization model.
+  - Node.js worker threads require `tsx`, `ts-node`, or pre-compilation to resolve TypeScript worker entry points. This adds friction and breaks the zero-config developer experience.
+  - Bun's `SharedArrayBuffer` + `Atomics` implementation is fully compatible with the spec.
+  - Focusing on one runtime reduces testing surface and lets us leverage Bun-specific optimizations.
+* **Trade-off:** Users on Node.js cannot use `@nilejs/future` without Bun. This excludes a large segment of the JS ecosystem.
+* **Mitigation:** Document the Bun requirement clearly. If demand is high, Node.js support can be added later via a `tsx` loader or pre-compiled worker bootstrap.
+* **Status:** Bun-only for now. Node.js support is a **planned future enhancement** (see Milestones).
+
+* **Decision:** Provide buffer allocation and serialization utilities via `ctx.fmt` namespace.
+* **Why:** Developers shouldn't think about `Uint8Array`, `TextEncoder`, or manual serialization. Keep low-level details abstracted.
+* **Configuration:** Default codec is JSON, but configurable per supervisor.
+* **Design:**
+  - `ctx.fmt.alloc(size)` - Buffer allocation (replaces `new Uint8Array(length)`)
+  - `ctx.fmt.from(data)` - Create buffer from data with auto-encoding
+  - `ctx.fmt.encode(data)` - Auto-detect encoding (string→UTF8, object→JSON, TypedArray→passthrough)
+  - `ctx.fmt.decode(buffer)` - Auto-detect decoding (JSON→object, string→UTF8, else raw)
+  - `ctx.fmt.json.encode/decode` - Explicit JSON encoding/decoding
+  - `ctx.fmt.string.encode/decode` - Explicit string encoding/decoding
+  - `ctx.fmt.cbor.encode/decode` - CBOR encoding/decoding (if available)
+
 ---
 
 ## 3. Technical Architecture
@@ -61,7 +85,7 @@ The `SharedArrayBuffer` is divided into a **Control Header** and a **Data Region
 
 | Section | Type | Description |
 | --- | --- | --- |
-| **State Board** | `Int32Array` | Indices tracking Box state: `0` (Clean), `1` (Locked/Writing), `2` (Ready). |
+| **State Board** | `Int32Array` | Indices tracking Box state: `0` (Clean), `1` (Locked/Writing), `2` (Ready), `3` (Reading). |
 | **Lease Tracker** | `BigInt64Array` | Timestamps (`expiresAt`) of when each lock expires. `0` = no lease. |
 | **Data Boxes** | `Uint8Array` | Fixed-size memory segments (configurable `boxSize`). |
 
@@ -69,6 +93,23 @@ The `SharedArrayBuffer` is divided into a **Control Header** and a **Data Region
 
 1. **Tier 1 (Control):** A PubSub implementation over `worker.postMessage`. Used for `self.send()`, `ctx.resources` (Resource Manager) intents, and heartbeats.
 2. **Tier 2 (Data):** Atomic-locked memory access. Used for `ctx.deposit()`. Uses `Atomics.compareExchange` for non-blocking lock acquisition.
+
+### State Machine
+
+The State Board implements a 4-state machine with reference counting for concurrent reads:
+
+```
+CLEAN(0) --acquireLock()--> LOCKED(1) --ctx.done()--> READY(2) --actor.read()/ctx.read()--> READING(3) --actor.done()/ctx.done()--> CLEAN(0)
+                                                              ^                                      |
+                                                              └──────── concurrent readers ──────────┘
+```
+
+- **CLEAN(0):** Box available for acquisition. `tryAcquireBox()` uses `CAS(CLEAN→LOCKED)`.
+- **LOCKED(1):** Writer owns the box. Writer writes directly to SAB, then calls `ctx.done()`.
+- **READY(2):** Data ready. Subscribers notified via `DEPOSIT_READY`. Transitions to READING on first read.
+- **READING(3):** One or more active readers. Reference count tracked by supervisor. Last reader triggers `READING→CLEAN`.
+
+All state transitions are serialized on the main thread. Workers request reads via `READ_START` / `READ_GRANTED` messages.
 
 ---
 
@@ -165,6 +206,12 @@ const actor = supervisor.spawn(async (self, msg, ctx) => {
   ctx.deposit(lock, uint8Data);
   ctx.done(lock);
 
+  // Tier 2: Read from another actor's deposit (worker context)
+  const readLock = msg.lock;
+  const buffer = await ctx.read(readLock);
+  const data = ctx.fmt.decode(buffer);
+  ctx.done(readLock);
+
   // Explicit Heartbeat (resets lease during CPU-intensive loops)
   ctx.heartbeat();
 
@@ -230,7 +277,8 @@ Most libraries in TypeScript and JavaScript cannot do this. @nilejs/future and E
 | `self.send(msg)` | 1 | Send signal/status to subscribers. Triggers implicit heartbeat. |
 | `ctx.acquireLock()` | 2 | Acquire a box from the pool. Returns lock with `byteOffset` and `length`. |
 | `ctx.deposit(lock, data)` | 2 | Write data to the box. Triggers implicit heartbeat. |
-| `ctx.done(lock)` | 2 | Finalize write, notify subscribers, release lock. |
+| `ctx.read(lock)` | 2 | Read data from a READY box (async in worker, sync on main thread). |
+| `ctx.done(lock)` | 2 | Finalize write (READY→CLEAN) or release read lock (READING→CLEAN). |
 | `ctx.heartbeat()` | 1 | Explicitly reset lease timer during CPU-intensive loops. |
 | `ctx.resources.*` | 1 | Access resources via Proxy. Calls go through intent relay. |
 | `ctx.link(actor)` | 1 | Create bi-directional link. If either dies, both die. |
@@ -259,7 +307,7 @@ If an actor requests a lock and no boxes are available:
 
 Inside the worker callback, `ctx.resources` is a **Proxy**.
 
-* **Call:** `ctx.resources.db.query(sql)`
+* **Call:** `ctx.resources.db.query({ sql: 'SELECT 1' })`
 * **Action:** Proxy intercepts the call, packages it as an "Intent Packet," and sends it via Tier 1 to the Supervisor.
 * **Return:** Supervisor executes the real logic and sends the result back to the worker.
 * **Release:** Each resource can define a `release()` method called during Supervisor cleanup.
@@ -270,7 +318,7 @@ Inside the worker callback, `ctx.resources` is a **Proxy**.
 1. **Definition:** Define resources in `createSupervisor` config with optional `release` method.
 2. **Schema:** Each method defines input/output Zod schemas for validation.
 3. **Mapping:** Supervisor maps method names to actual functions.
-4. **Call:** Actor calls `await ctx.resources.db.query(sql)`.
+4. **Call:** Actor calls `await ctx.resources.db.query({ sql: 'SELECT 1' })`.
 5. **Validation:** Zod validates arguments against input schema before execution.
 6. **Serialization:** Proxy converts validated arguments into a serializable Tier 1 message.
 7. **Execution:** Main Thread receives message, runs the handler.
@@ -400,7 +448,7 @@ The Supervisor manages three distinct "Health" metrics for every actor:
 
 ## 13. Delivery Milestones
 
-1. **Phase 1:** Tier 1 PubSub and Callback Serialization (Bun/Node).
+1. **Phase 1:** Tier 1 PubSub and Callback Serialization (Bun).
 2. **Phase 2:** SAB implementation with Atomic locking, FIFO queue, and pool strategy.
 3. **Phase 3:** Resource Manager Proxy implementation with release methods and Zod schemas.
 4. **Phase 4:** Opportunistic lease cleanup, backpressure logic, and diagnostics.
@@ -678,10 +726,10 @@ ctx.deposit(lock, ctx.fmt.encode(data));  // Auto JSON encoding
 ctx.done(lock);
 
 // Reading structured data from Tier 2
-const lock = await ctx.acquireLock();
-const buffer = ctx.read(lock);
+const lock = msg.lock;                    // Lock passed via Tier 1
+const buffer = await ctx.read(lock);      // Async in worker
 const data = ctx.fmt.decode(buffer);      // Auto JSON decoding
-ctx.done(lock);
+ctx.done(lock);                           // Release read lock
 
 // Working with strings
 const text = ctx.fmt.encode("hello world");  // UTF-8 bytes
@@ -760,6 +808,7 @@ reconciler.subscribe((msg) => {
     DEPOSIT_READY: (m) => {
       const data = reconciler.read(m.address);
       println("Batch reconciled.");
+      reconciler.done(m.address);
     },
     _: () => {},
   });
@@ -862,35 +911,42 @@ const pipeline = supervisor.createGroup({
   strategy: 'rest-for-one'  // Restart downstream on upstream failure
 });
 
-// Stage 1: Data Ingest
+// Stage 1: Data Ingest — deposits to Tier 2, main thread reads
 const ingest = pipeline.spawn(async (self, msg, ctx) => {
   const rawData = await ctx.resources.storage.fetch(msg.url);
   const lock = await ctx.acquireLock();
   ctx.deposit(lock, rawData);
-  ctx.done(lock);
+  ctx.done(lock);  // Marks READY, fires DEPOSIT_READY
   self.send({ type: 'INGESTED' });
 });
 
-// Stage 2: Transformer (Depends on Ingest)
-const transform = pipeline.spawn(async (self, msg, ctx) => {
-  match(msg, {
-    INGESTED: async () => {
-      const data = pipeline.read(msg.address);
-      const transformed = processData(data);
-      const lock = await ctx.acquireLock();
-      ctx.deposit(lock, transformed);
-      ctx.done(lock);
+// Main thread subscriber reads Tier 2 data (actor.read is main-thread only)
+ingest.subscribe((msg) => {
+  matchAll(msg, {
+    DEPOSIT_READY: (m) => {
+      const data = ingest.read((m as any).address);
+      // Process on main thread, then forward via Tier 1
+      const transformed = data.map((x: number) => x * 2);
+      ingest.done((m as any).address);
+      transform.spawn({ data: transformed });
     },
     _: () => {}
   });
 });
 
-// Stage 3: Output (Depends on Transform)
+// Stage 2: Transformer — receives data via Tier 1 message
+const transform = pipeline.spawn(async (self, msg, ctx) => {
+  const data = msg.data;
+  // Process inline — no outer scope capture
+  const result = data.reduce((sum: number, x: number) => sum + x, 0);
+  self.send({ type: 'TRANSFORMED', result });
+});
+
+// Stage 3: Output
 const output = pipeline.spawn(async (self, msg, ctx) => {
-  match(msg, {
-    TRANSFORMED: () => {
-      const data = pipeline.read(msg.address);
-      await ctx.resources.storage.save(msg.outputPath, data);
+  matchAll(msg, {
+    TRANSFORMED: async (m) => {
+      await ctx.resources.storage.save((m as any).outputPath, (m as any).result);
       self.send({ type: 'COMPLETE' });
     },
     _: () => {}
@@ -954,13 +1010,14 @@ const searcher = supervisor.spawn(
 );
 
 // Analyst Agent (Linked to Searcher)
+// Receives data via Tier 1 message — cannot read searcher's deposit directly
+// (serialized callbacks lose outer scope)
 const analyst = supervisor.spawn(
   async (self, msg, ctx) => {
-    match(msg, {
-      SEARCH_COMPLETE: async () => {
-        const lock = msg.address;
-        const rawHtml = analyst.read(lock);
-        const analysis = await ctx.resources.llm.analyze(rawHtml);
+    matchAll(msg, {
+      SEARCH_COMPLETE: async (m) => {
+        const htmlData = (m as any).htmlData;
+        const analysis = await ctx.resources.llm.analyze(htmlData);
         self.send({ type: 'ANALYSIS_COMPLETE', result: analysis });
       },
       _: () => {}
@@ -1050,7 +1107,7 @@ process.on('SIGTERM', () => supervisor.shutdown());
 
 ## 20. Pitch
 
-> "@nilejs/future turns your Bun/Node runtime into a multi-lane highway. It combines **Atomic Shared Memory** with **Erlang-style Supervision**, letting you build AI agent swarms and high-throughput systems that are physically impossible to build with standard JS. It's not just a library, it is a runtime upgrade for the Agentic Era."
+> "@nilejs/future turns your Bun runtime into a multi-lane highway. It combines **Atomic Shared Memory** with **Erlang-style Supervision**, letting you build AI agent swarms and high-throughput systems that are physically impossible to build with standard JS. It's not just a library, it is a runtime upgrade for the Agentic Era."
 
 ### The Problem It Solves
 
