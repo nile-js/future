@@ -186,10 +186,15 @@ const inboxes: Map<ActorId, InboxEntry[]>;
 - If Node.js support is needed, it requires a pre-compiled worker bootstrap or `tsx` loader — not currently implemented.
 
 ## Documentation Status
-- `README.md` — Current. All examples match actual API.
-- `spec-final.md` — Canonical spec (1400 lines, 20 sections, 8 ADRs).
-- `docs/ADR-006-bun-only-runtime.md` — Current
-- `context.md` — Current (this file)
+- `README.md` — Simplified overview (267 lines). Deep dives moved to /docs.
+- `docs/architecture.md` — Worker model, memory pool, state machine, performance, slang-ts
+- `docs/shared-memory.md` — Tier 2, write/read/release, authorization, lease, buffer, lock
+- `docs/supervision.md` — Strategies, groups, linking, monitoring, child actors, termination, backoff
+- `docs/diagnostics.md` — Configuration reference, sampling, per-actor and supervisor metrics
+- `docs/resources.md` — Intent relay, schema validation, cleanup hooks
+- `spec-final.md` — Canonical spec (1400 lines, 20 sections, 8 ADRs)
+- `docs/ADR-006-bun-only-runtime.md` — Bun-only runtime decision
+- `context.md` — Project context (this file)
 
 ## Known Limitations
 - `ctx.read(m)` returns `null` for all decoders if `m.handle` is absent (Tier 1 message). Callers should check.
