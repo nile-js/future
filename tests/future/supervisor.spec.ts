@@ -35,7 +35,7 @@ describe("tier 1 messaging", () => {
     });
 
     actor.subscribe((msg) => messages.push(msg));
-    actor.spawn("start");
+    actor.receive("start");
     await wait(100);
 
     expect(messages.length).toBeGreaterThanOrEqual(1);
@@ -53,7 +53,7 @@ describe("tier 1 messaging", () => {
     });
 
     actor.subscribe((msg) => messages.push(msg));
-    actor.spawn("start");
+    actor.receive("start");
     await wait(100);
 
     const m = messages.find((x) => x.msg === "test");
@@ -71,7 +71,7 @@ describe("tier 1 messaging", () => {
 
     actor.subscribe((msg) => msgs1.push(msg));
     actor.subscribe((msg) => msgs2.push(msg));
-    actor.spawn("start");
+    actor.receive("start");
     await wait(100);
 
     expect(msgs1.length).toBeGreaterThanOrEqual(1);
@@ -87,11 +87,11 @@ describe("tier 1 messaging", () => {
     });
 
     const unsub = actor.subscribe((msg) => messages.push(msg));
-    actor.spawn("first");
+    actor.receive("first");
     await wait(100);
     unsub();
 
-    actor.spawn("second");
+    actor.receive("second");
     await wait(100);
 
     expect(messages).toHaveLength(1);
@@ -105,7 +105,7 @@ describe("tier 1 messaging", () => {
     const actor = sup.spawn(async (self) => {
       self.send("broadcast");
     });
-    actor.spawn("start");
+    actor.receive("start");
     await wait(100);
 
     expect(messages.some((m) => m.msg === "broadcast")).toBe(true);
@@ -143,7 +143,7 @@ describe("tier 2 shared memory", () => {
         if (m.msg === "write_ok" && m.data) resolve(m.data as { boxIndex: number; epoch: number });
         if (m.msg === "write_err") reject(new Error((m.data as { error: string }).error));
       });
-      actor.spawn("write");
+      actor.receive("write");
     });
 
     expect(lockData.boxIndex).toBeGreaterThanOrEqual(0);
@@ -174,7 +174,7 @@ describe("tier 2 shared memory", () => {
           }
         }
       });
-      actor.spawn("write");
+      actor.receive("write");
     });
 
     expect(data).toEqual({ hello: "world" });
@@ -192,7 +192,7 @@ describe("tier 2 shared memory", () => {
           resolve(actor.read(m));
         }
       });
-      actor.spawn("start");
+      actor.receive("start");
     });
 
     expect(result).toBeNull();
@@ -218,7 +218,7 @@ describe("tier 2 shared memory", () => {
           resolve((m.data as { handle: Lock }).handle);
         }
       });
-      actor.spawn("write");
+      actor.receive("write");
     });
 
     await wait(50);
@@ -251,7 +251,7 @@ describe("tier 2 shared memory", () => {
           if (reader) resolve(reader.json());
         }
       });
-      actor.spawn("write");
+      actor.receive("write");
     });
 
     expect(data).toEqual({ key: "value" });
@@ -276,7 +276,7 @@ describe("tier 2 shared memory", () => {
           if (reader) resolve(reader.string());
         }
       });
-      actor.spawn("write");
+      actor.receive("write");
     });
 
     expect(stripNulls(data)).toBe("hello world");
@@ -312,7 +312,7 @@ describe("authorization", () => {
           if (reader) resolve(reader.json());
         }
       });
-      actor.spawn("write");
+      actor.receive("write");
     });
 
     expect(data).toEqual({ secret: true });
@@ -340,7 +340,7 @@ describe("authorization", () => {
           resolve((m.data as { handle: Lock }).handle);
         }
       });
-      writer.spawn("write");
+      writer.receive("write");
     });
 
     expect(handle.boxIndex).toBeGreaterThanOrEqual(0);
@@ -373,7 +373,7 @@ describe("lifecycle", () => {
 
   it("terminate kills worker thread", async () => {
     const actor = sup.spawn(async (self) => { self.send("alive"); });
-    actor.spawn("start");
+    actor.receive("start");
     await wait(100);
 
     actor.terminate();
@@ -414,7 +414,7 @@ describe("lifecycle", () => {
       throw new Error("intentional");
     });
 
-    actor.spawn("boom");
+    actor.receive("boom");
     await wait(300);
 
     const diag = actor.getDiagnostics();
@@ -477,7 +477,7 @@ describe("diagnostics", () => {
 
   it("actor.getDiagnostics returns per-actor metrics", async () => {
     const actor = sup.spawn(async (self) => { self.send("x"); });
-    actor.spawn("start");
+    actor.receive("start");
     await wait(100);
 
     const diag = actor.getDiagnostics();
@@ -545,7 +545,7 @@ describe("edge cases", () => {
         const m = msg as Message;
         if (m.msg === "roundtrip") resolve(m.data);
       });
-      actor.spawn("test");
+      actor.receive("test");
     });
 
     expect(result).toEqual({ test: 123 });
@@ -586,7 +586,7 @@ describe("epoch stale-handle rejection", () => {
           resolve((m.data as { handle: Lock }).handle);
         }
       });
-      actor.spawn("write");
+      actor.receive("write");
     });
 
     await new Promise<void>((resolve) => {
@@ -638,7 +638,7 @@ describe("per-actor INBOX delivery", () => {
       });
 
       // Trigger reader to be ready
-      reader.spawn("ready");
+      reader.receive("ready");
     });
 
     await wait(100);
@@ -653,7 +653,7 @@ describe("per-actor INBOX delivery", () => {
       if (result.isOk) self.send("written");
     });
 
-    writer.spawn("write");
+    writer.receive("write");
 
     const data = await inboxData;
     expect(data).toEqual({ team: true, value: 99 });
@@ -688,7 +688,7 @@ describe("authorization enforcement", () => {
     unauthorized.subscribe((msg) => {
       if (msg.msg === "inbox-leak") leaked = true;
     });
-    unauthorized.spawn("ready");
+    unauthorized.receive("ready");
     await wait(100);
 
     const writer = group.spawn(async (self, _msg, ctx) => {
@@ -705,7 +705,7 @@ describe("authorization enforcement", () => {
       writer.subscribe((msg) => {
         if (msg.msg === "written") resolve();
       });
-      writer.spawn("write");
+      writer.receive("write");
     });
 
     await wait(300);
@@ -731,7 +731,7 @@ describe("authorization enforcement", () => {
           if (reader) resolve(reader.json());
         }
       });
-      actor.spawn("write");
+      actor.receive("write");
     });
 
     expect(data).toEqual({ secret: true });
@@ -806,7 +806,7 @@ describe("one writer per WRITING box", () => {
     });
 
     // Spawn B first (will hold one box)
-    actorB.spawn("write");
+    actorB.receive("write");
     await new Promise<void>((resolve) => {
       actorB.subscribe((msg) => {
         if (msg.msg === "b-written") resolve();
@@ -816,7 +816,7 @@ describe("one writer per WRITING box", () => {
     await wait(100);
 
     // Spawn A (will hold the other box)
-    actorA.spawn("write");
+    actorA.receive("write");
     await new Promise<void>((resolve) => {
       actorA.subscribe((msg) => {
         if (msg.msg === "a-written") resolve();
@@ -826,7 +826,7 @@ describe("one writer per WRITING box", () => {
     await wait(100);
 
     // Now both boxes are in use. Spawn C — should queue.
-    actorC.spawn("write");
+    actorC.receive("write");
 
     // Wait for A to release (1s)
     const handleC = await cPromise;
@@ -863,7 +863,7 @@ describe("lease expiry kills WRITING actor", () => {
       writer.subscribe((msg) => {
         if (msg.msg === "write-requested") resolve();
       });
-      writer.spawn("write");
+      writer.receive("write");
     });
 
     await wait(100);
@@ -883,7 +883,7 @@ describe("lease expiry kills WRITING actor", () => {
       trigger.subscribe((msg) => {
         if (msg.msg === "trigger-check") resolve();
       });
-      trigger.spawn("trigger");
+      trigger.receive("trigger");
     });
 
     await wait(200);
@@ -947,7 +947,7 @@ describe("supervisor.terminateActor", () => {
       self.send("alive");
     });
 
-    actor.spawn("start");
+    actor.receive("start");
     await wait(100);
 
     const diagBefore = actor.getDiagnostics();
@@ -983,7 +983,7 @@ describe("ctx.isCancelled", () => {
           resolve((m.data as { value: boolean }).value);
         }
       });
-      actor.spawn("check");
+      actor.receive("check");
     });
 
     expect(result).toBe(false);
@@ -1002,7 +1002,7 @@ describe("ctx.isCancelled", () => {
           resolve((m.data as { value: boolean }).value);
         }
       });
-      actor.spawn("check");
+      actor.receive("check");
     });
 
     expect(beforeVal).toBe(false);
@@ -1048,7 +1048,7 @@ describe("ChainableReader.binary and raw", () => {
           if (reader) resolve(reader.binary());
         }
       });
-      actor.spawn("write");
+      actor.receive("write");
     });
 
     expect(data).toBeInstanceOf(Uint8Array);
@@ -1081,7 +1081,7 @@ describe("ChainableReader.binary and raw", () => {
           if (reader) resolve(reader.raw());
         }
       });
-      actor.spawn("write");
+      actor.receive("write");
     });
 
     expect(data).toBeInstanceOf(Uint8Array);
@@ -1127,7 +1127,7 @@ describe("explicit heartbeat", () => {
       actor.subscribe((msg) => {
         if (msg.msg === "survived") { clearTimeout(timeout); resolve(true); }
       });
-      actor.spawn("write");
+      actor.receive("write");
     });
 
     expect(survived).toBe(true);
@@ -1143,7 +1143,7 @@ describe("explicit heartbeat", () => {
 
     await new Promise<void>((resolve) => {
       actor.subscribe((msg) => { if (msg.msg === "done") resolve(); });
-      actor.spawn("start");
+      actor.receive("start");
     });
 
     const diag = actor.getDiagnostics();
@@ -1175,7 +1175,7 @@ describe("implicit heartbeat", () => {
 
     await new Promise<void>((resolve) => {
       actor.subscribe((msg) => { if (msg.msg === "done") resolve(); });
-      actor.spawn("start");
+      actor.receive("start");
     });
 
     const diag = actor.getDiagnostics();
@@ -1229,7 +1229,7 @@ describe("resource manager integration", () => {
         const m = msg as Message;
         if (m.msg === "query-result") { clearTimeout(timeout); resolve(m.data); }
       });
-      actor.spawn("start");
+      actor.receive("start");
     });
 
     expect(data).toEqual([{ id: 1, sql: "SELECT 1" }]);
@@ -1256,7 +1256,7 @@ describe("resource manager integration", () => {
         }
         if (m.msg === "no-error") { clearTimeout(timeout); resolve("no-error"); }
       });
-      actor.spawn("start");
+      actor.receive("start");
     });
 
     expect(result).not.toBe("no-error");
@@ -1290,7 +1290,7 @@ describe("ctx.spawn from worker", () => {
           resolve((m.data as { childId: string }).childId);
         }
       });
-      parent.spawn("start");
+      parent.receive("start");
     });
 
     expect(childId).toBeDefined();
@@ -1317,7 +1317,7 @@ describe("callback validation", () => {
 
   it("rejects callback with require()", async () => {
     const actor = sup.spawn(async () => { require("fs"); });
-    actor.spawn("start");
+    actor.receive("start");
     await wait(300);
     const diag = actor.getDiagnostics();
     expect(diag.isErr).toBe(true);
@@ -1325,7 +1325,7 @@ describe("callback validation", () => {
 
   it("rejects callback with process global", async () => {
     const actor = sup.spawn(async () => { process.exit(1); });
-    actor.spawn("start");
+    actor.receive("start");
     await wait(300);
     const diag = actor.getDiagnostics();
     expect(diag.isErr).toBe(true);
@@ -1333,7 +1333,7 @@ describe("callback validation", () => {
 
   it("rejects callback with eval()", async () => {
     const actor = sup.spawn(async () => { eval("1+1"); });
-    actor.spawn("start");
+    actor.receive("start");
     await wait(300);
     const diag = actor.getDiagnostics();
     expect(diag.isErr).toBe(true);
@@ -1341,7 +1341,7 @@ describe("callback validation", () => {
 
   it("rejects callback with Function constructor", async () => {
     const actor = sup.spawn(async () => { new Function("return 1")(); });
-    actor.spawn("start");
+    actor.receive("start");
     await wait(300);
     const diag = actor.getDiagnostics();
     expect(diag.isErr).toBe(true);
@@ -1353,7 +1353,7 @@ describe("callback validation", () => {
       self.send("safe", { ok: true });
     });
     actor.subscribe((msg) => messages.push(msg as Message));
-    actor.spawn("start");
+    actor.receive("start");
     await wait(200);
 
     const safe = messages.find((m) => m.msg === "safe");
@@ -1404,13 +1404,13 @@ describe("linked authorization", () => {
           resolve((m.data as { json: unknown }).json);
         }
       });
-      reader.spawn("ready");
+      reader.receive("ready");
     });
 
     await wait(100);
 
     // Writer writes with share: "linked"
-    writer.spawn("write");
+    writer.receive("write");
 
     const data = await readerData;
     expect(data).toEqual({ shared: true });
@@ -1437,10 +1437,10 @@ describe("linked authorization", () => {
     });
 
     unlinked.subscribe((msg) => { if (msg.msg === "leak") leaked = true; });
-    unlinked.spawn("ready");
+    unlinked.receive("ready");
     await wait(100);
 
-    writer.spawn("write");
+    writer.receive("write");
     await wait(300);
 
     expect(leaked).toBe(false);
@@ -1480,7 +1480,7 @@ describe("per-actor timeout overrides", () => {
       slowWriter.subscribe((msg) => {
         if (msg.msg === "write-requested") resolve();
       });
-      slowWriter.spawn("write");
+      slowWriter.receive("write");
     });
 
     await wait(100);
@@ -1496,7 +1496,7 @@ describe("per-actor timeout overrides", () => {
     const trigger = sup.spawn(async (self) => { self.send("trigger"); });
     await new Promise<void>((resolve) => {
       trigger.subscribe((msg) => { if (msg.msg === "trigger") resolve(); });
-      trigger.spawn("start");
+      trigger.receive("start");
     });
     await wait(200);
 
@@ -1536,7 +1536,7 @@ describe("resource cleanup on shutdown", () => {
     });
 
     const actor = sup.spawn(async (self) => { self.send("alive"); });
-    actor.spawn("start");
+    actor.receive("start");
     await wait(100);
 
     await sup.shutdown();

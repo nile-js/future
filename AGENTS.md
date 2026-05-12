@@ -126,7 +126,7 @@ Every time you delegate work to a sub-agent, your prompt MUST include ALL of the
 
 ### Required Delegation Checklist
 
-1. **Caveman skill**: Tell sub-agent to load and use the caveman skill (full mode, not ultra). Example: `"Use the caveman skill (full mode) for all communication."`
+1. **Caveman skill**: Tell sub-agent to load and use the caveman skill (full mode, not ultra). **Exception: documentation-engineer does NOT use caveman.** Wording is their craft — they need full language precision. Example: `"Use the caveman skill (full mode) for all communication."` (skip this for documentation-engineer)
 2. **AGENTS.md compliance**: Tell sub-agent to follow AGENTS.md rules. Example: `"Follow all rules in /AGENTS.md — no classes, factory functions, named params, safeTry, etc."`
 3. **Context file**: If `/context.md` exists and is relevant, reference it. Example: `"Read /context.md for project architecture, patterns, and conventions before starting."`
 4. **Token economics**: Remind sub-agent: `"Never return full file contents. Extract only what's needed: signatures, line numbers, key logic, summaries. I will read files myself if I need full contents."`

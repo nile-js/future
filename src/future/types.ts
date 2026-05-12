@@ -85,7 +85,7 @@ export type ActorCallback = (self: ActorSelf, msg: unknown, ctx: ActorContext) =
 /** ActorRef — main-thread handle to a running actor. read/release are synchronous. */
 export type ActorRef = {
   readonly id: ActorId;
-  readonly spawn: (msg: unknown) => void;
+  readonly receive: (msg: unknown) => void;
   readonly subscribe: (fn: (msg: Message) => void) => () => void;
   readonly terminate: () => void;
   readonly read: (msg: Message) => ChainableReader | null;

@@ -125,10 +125,10 @@ const child = await ctx.spawn(async (selfChild, msgChild, ctxChild) => {
   });
 });
 
-child.spawn({ value: 42 });  // Send initial message
+child.receive({ value: 42 });  // Send initial message
 ```
 
-The child `ActorRef` from `ctx.spawn()` has a limited API in the worker context: `spawn()`, `terminate()`, `link()`, and `monitor()` work. `subscribe()`, `read()`, and `release()` throw `Not available in worker context`.
+The child `ActorRef` from `ctx.spawn()` has a limited API in the worker context: `receive()`, `terminate()`, `link()`, and `monitor()` work. `subscribe()`, `read()`, and `release()` throw `Not available in worker context`.
 
 ## Termination Guarantees
 

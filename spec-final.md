@@ -261,7 +261,7 @@ const actor = supervisor.spawn(async (self, msg, ctx) => {
 });
 
 // Spawn with state via msg
-actor.spawn({ timeout: 5000, dataId: 'abc123' });
+actor.receive({ timeout: 5000, dataId: 'abc123' });
 ```
 
 ```typescript
@@ -370,7 +370,7 @@ Most libraries in TypeScript and JavaScript cannot do this. @nilejs/future and E
 | Method | Description |
 |---|---|
 | `actor.id` | Unique actor identifier |
-| `actor.spawn(msg)` | Send initial message to actor |
+| `actor.receive(msg)` | Send message to actor |
 | `actor.subscribe(fn)` | Subscribe to actor messages |
 | `actor.terminate()` | Terminate actor immediately |
 | `actor.read(m)` | Read SAB data from message. Returns chainable decoder. |

@@ -36,7 +36,7 @@ export function createActorRef(options: {
     monitor,
   } = options;
 
-  const spawn = (msg: unknown): void => {
+  const receive = (msg: unknown): void => {
     sendToWorker({ type: "SPAWN", data: msg });
   };
 
@@ -62,7 +62,7 @@ export function createActorRef(options: {
 
   return Object.freeze({
     id,
-    spawn,
+    receive,
     subscribe,
     terminate,
     read,

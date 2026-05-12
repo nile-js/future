@@ -1,52 +1,71 @@
 # Future
 
-High-performance actor primitives for Bun, inspired by Erlang.
+High-performance, system-level actor and tasks runtime for TypeScript, inspired by Erlang.
 
-## Install
+## Briefing
 
-```
-npm install @nilejs/future
-```
+You have seen a function hang forever. The event loop is blocked. Your server freezes. No request gets through. There is nothing you can do but wait for the process manager to kill the whole thing.
 
-**Requirements:** Bun v1.0+, TypeScript v4.5+
+`AbortController` does not help here. It ignores results while code keeps running. The thread is still stuck. Memory is still held. Cleanup never runs.
 
-Note: `@nilejs/future` is designed exclusively for the Bun runtime. The underlying APIs (worker_threads, SharedArrayBuffer) exist in Node.js, but the library relies on Bun's native TypeScript support and worker thread resolution for actor callback serialization. Node.js support is not available.
+Future gives you true termination. When you kill an actor, the worker thread dies. All resources are released. Other actors keep running. No shared state to corrupt. No cascading failure. The problem stops exactly when you say so.
 
-## Quick Example
+## Core Concepts
+
+A **supervisor** manages the entire actor system. It creates actors, monitors their health, handles failures, and owns the shared memory pool. You start here.
+
+An **actor** is an isolated execution context running in its own thread. Actors do not share memory. They communicate via messages. Each actor has a unique ID, a message inbox, and lifecycle controlled by the supervisor.
+
+Actors can:
+- Send signals to subscribers via `self.send(msg, data?)` (Tier 1, lightweight)
+- Share large data via `ctx.write()` and `ctx.read()` (Tier 2, zero-copy shared memory)
+- Access main-thread resources through `ctx.resources` (proxy with schema validation)
+- Spawn child actors, link to other actors, monitor failures
+
+The supervisor enforces boundaries. Actors cannot access each other's memory directly. All communication goes through the supervisor's message routing and authorization layer.
+
+## Featured Example
+
+An actor performs computation that might hang. The supervisor spawns it, you send it work, and if it takes too long you terminate it. Resources clean up. Other actors are unaffected.
 
 ```typescript
-import { createSupervisor, println } from "@nilejs/future";
+import { createSupervisor, println, matchAll } from "@nilejs/future";
 
 const supervisor = createSupervisor({
   maxActors: 10,
   memory: { poolSize: 5, boxSize: "1mb" },
+  timeouts: { defaultLeaseMs: 5000 },
 });
 
+// Spawn an actor that processes data
 const actor = supervisor.spawn(async (self, msg, ctx) => {
-  const result = msg.input.toUpperCase();
+  self.send("started", { input: msg.input });
 
-  // Tier 1: lightweight signal via postMessage
-  self.send("progress", { percent: 0.5 });
+  // Heavy computation (or external call that might hang)
+  const result = await fragileComputation(msg.input);
+  const encoded = ctx.fmt.encode({ text: result });
 
-  // Tier 2: zero-copy shared memory write
+  // Write result to shared memory
   const writeResult = await ctx.write({
-    msg: "result",
+    msg: "done",
     type: "json",
-    data: ctx.fmt.encode({ text: result }),
+    data: encoded,
     share: "owner",
   });
 
   if (writeResult.isOk) {
-    self.send("done", { handle: writeResult.value });
+    self.send("result", { handle: writeResult.value });
   }
 });
 
-actor.spawn({ input: "hello future" });
+// Send work to the actor
+actor.receive({ input: "process me" });
 
+// Subscribe to results
 actor.subscribe((msg) => {
   matchAll(msg, {
-    progress: (m) => println("Progress:", m.data.percent),
-    done: (m) => {
+    started: (m) => println("Started:", m.data.input),
+    result: (m) => {
       const reader = actor.read(m);
       if (reader) {
         println("Result:", reader.json());
@@ -56,120 +75,122 @@ actor.subscribe((msg) => {
     _: () => {},
   });
 });
+
+// If it hangs, terminate on demand. Thread dies. Memory freed.
+setTimeout(() => actor.terminate(), 3000);
 ```
 
-## The Problem
+Three guarantees hold: the actor stops immediately, its resources are freed, and all other actors continue unaffected.
 
-Standard JavaScript has no built-in protection against:
-- Infinite loops that hang the event loop
-- Functions that consume all memory
-- Unreleased resources from crashed code
-- Cascading failures that bring down the entire system
+## Quick Features
 
-## The Solution
+- **True termination** via worker thread kill, not AbortController
+- **Two-tier communication**: lightweight Tier 1 signals plus zero-copy Tier 2 shared memory
+- **Supervision strategies**: one-for-one, one-for-all, rest-for-one
+- **Automatic lease expiry** for stalled actors
+- **Actor linking** (bi-directional) and **monitoring** (uni-directional)
+- **Schema-validated resource access** from workers via proxy
+- **Child actor spawning** from within worker callbacks
+- **Configurable diagnostics** with sampling and per-metric toggles
+- **No CAS, no atomic contention** on shared memory
 
-future isolates execution in separate threads with automatic cleanup:
-- Any actor can be terminated on demand
-- Hanging code is killed via heartbeat timeout
-- Resource cleanup is guaranteed on termination
-- One actor failure cannot corrupt others
+## Erlang Inspiration
+
+Future draws from Erlang's proven concurrency model.
+
+**Let It Crash.** Actors fail independently. The supervisor handles recovery. Code does not guard every edge case.
+
+**Supervision Trees.** Actors form hierarchies. A parent failure triggers strategy-driven cleanup of children.
+
+**Actor Isolation.** Each actor runs in its own thread. No shared memory corruption. No cross-actor state leaks.
+
+**Linking.** Two linked actors share a failure bond. When one dies, the other terminates too.
+
+**Monitoring.** One actor watches another without linking. Receives a notification on death.
+
+Supervision strategies:
+
+- `one-for-one`: restart only the failed actor
+- `one-for-all`: restart all actors in the group
+- `rest-for-one`: restart the failed actor and all actors started after it
+
+## Install
+
+```
+npm install @nilejs/future
+```
+
+**Requirements:** Bun v1.0+, TypeScript v4.5+
+
+Future is designed for the Bun runtime. The underlying APIs (worker threads, SharedArrayBuffer) exist in Node.js, but the library relies on Bun native TypeScript support and worker thread resolution for actor callback serialization. Node.js support is planned but not yet available.
 
 ## Core Concepts
 
 ### Supervisor
 
-A supervisor manages actor lifecycle, monitors health, and handles failures. It owns the memory pool, inbox routing, and supervision strategies.
+Manages actor lifecycle, health monitoring, failure handling, memory pool, inbox routing, and supervision strategies.
 
 ```typescript
 const supervisor = createSupervisor({
   maxActors: 10,
   memory: { poolSize: 5, boxSize: "1mb" },
+  timeouts: { defaultLeaseMs: 5000 },
   strategy: "one-for-one",
   retry: { max: 3, backoff: "exponential" },
 });
 ```
 
-See [Architecture](https://github.com/nile-js/future/blob/main/docs/architecture.md) for the worker model, memory pool, and state machine.
-
 ### Actor
 
-An actor is an isolated execution context running in a separate thread. Actors communicate via messages and can share data through shared memory.
+An isolated execution context in a separate thread. Each actor has its own memory and event loop.
 
 ```typescript
 const actor = supervisor.spawn(async (self, msg, ctx) => {
-  // self: actor control (send, terminate)
+  // self: actor control (send, terminate, receive)
   // msg: incoming message
   // ctx: execution context (resources, shared memory, formatting)
 });
 ```
 
-Each actor has isolated memory and event loop, lifecycle tied to the supervisor, and access to resources via proxy.
+### Context
 
-### Context (ctx)
-
-The context is injected into every actor callback and provides all actor capabilities:
+Injected into every actor callback. Provides all runtime capabilities.
 
 | Method | Tier | Description |
 |---|---|---|
-| `self.send(msg, data?)` | 1 | Send signal to subscribers. Auto-injects `from`. |
-| `ctx.write({ msg, type, data, share? })` | 2 | Write data to shared memory. Returns `Result<Lock, string>`. |
-| `ctx.read(msg)` | 2 | Read shared memory data. Returns `ChainableReader \| null`. |
-| `ctx.release(handle)` | 2 | Decrement ref count. Box freed at 0. |
-| `ctx.heartbeat()` | 1 | Reset lease timer during long operations. |
-| `ctx.resources.*` | 1 | Access main-thread resources via proxy. |
-| `ctx.link(actor)` | 1 | Bi-directional failure propagation. |
-| `ctx.monitor(actor)` | 1 | Uni-directional notification on death. |
-| `ctx.spawn(callback)` | 1 | Spawn a child actor. |
-| `ctx.terminate()` | 1 | Terminate the actor. |
-| `ctx.isCancelled` | 1 | Check if actor was terminated. |
-| `ctx.fmt.*` | N/A | Buffer allocation and serialization. |
+| `self.send(msg, data?)` | 1 | Send signal to subscribers |
+| `ctx.write({ msg, type, data, share? })` | 2 | Write data to shared memory, returns `Result<Lock, string>` |
+| `ctx.read(msg)` | 2 | Read shared memory data, returns `ChainableReader` or `null` |
+| `ctx.release(handle)` | 2 | Decrement reference count, box freed at zero |
+| `ctx.heartbeat()` | 1 | Reset lease timer during long operations |
+| `ctx.resources.*` | 1 | Access main-thread resources via proxy |
+| `ctx.link(actor)` | 1 | Bi-directional failure propagation |
+| `ctx.monitor(actor)` | 1 | Uni-directional notification on death |
+| `ctx.spawn(callback)` | 1 | Spawn a child actor from the worker |
+| `ctx.terminate()` | 1 | Terminate the actor |
+| `ctx.isCancelled` | 1 | Check if the actor was terminated |
+| `ctx.fmt.*` | N/A | Buffer allocation and serialization |
 
 ### Two-Tier Communication
 
-Communication uses two tiers:
-
-- **Tier 1 (Control):** Lightweight signals via postMessage. Small messages, progress updates, heartbeats. `self.send("eventName", data)` with string key matching. `from` is auto-injected by the supervisor.
-- **Tier 2 (Data):** Zero-copy shared memory. Large data transfers without serialization. `ctx.write()` returns `Result<Lock, string>`. `ctx.read(msg)` returns `ChainableReader | null`. `ctx.release(handle)` frees the box.
+- **Tier 1 (Control):** lightweight signals via `postMessage`. Small messages, progress updates, heartbeats. `self.send("event", data)` with string key matching. `from` is auto-injected by the supervisor.
+- **Tier 2 (Data):** zero-copy shared memory via `SharedArrayBuffer`. Large data transfers without serialization. `ctx.write()` returns `Result<Lock, string>`. Data is immutable after commit.
 
 ### Message Shape
 
 ```typescript
 type Message = {
-  readonly msg: string;            // Message key for dispatch
-  readonly type?: FmtType;         // "json" | "string" | "binary" | "cbor"
-  readonly data?: unknown;         // Tier 1: deserialized JSON data
-  readonly handle?: Lock;          // Tier 2: shared memory box reference
-  readonly from: ActorId;          // Auto-injected by supervisor
+  readonly msg: string;       // Message key for dispatch
+  readonly type?: FmtType;    // "json" | "string" | "binary" | "cbor"
+  readonly data?: unknown;    // Tier 1: deserialized JSON data
+  readonly handle?: Lock;     // Tier 2: shared memory box reference
+  readonly from: ActorId;     // Auto-injected by supervisor
 };
 ```
 
-- `msg` is always required
-- `from` is always injected by the supervisor, never set by the sender
-- `handle` is present for Tier 2 data
-- `data` is present for Tier 1 messages
-
-## Erlang Inspired
-
-future draws from Erlang's proven concurrency model:
-
-**Let It Crash:** Actors can fail and the supervisor handles recovery. Code does not need to handle every possible error state.
-
-**Supervision Trees:** Actors are organized hierarchically. When a parent fails, children are handled according to the supervision strategy.
-
-**Actor Isolation:** Each actor has its own memory and cannot corrupt others. Failures are contained.
-
-**Linking:** Actors can be linked so that when one dies, the other is terminated. Creates dependency chains for related actors.
-
-**Monitoring:** Actors can monitor others without linking. When a monitored actor dies, the watcher receives a notification.
-
-Supervision strategies:
-- **one-for-one:** Restart only the failed actor
-- **one-for-all:** Restart all actors in the group
-- **rest-for-one:** Restart the failed actor and all actors started after it
-
 ## API Reference
 
-### Supervisor API
+### Supervisor
 
 ```typescript
 const actor = supervisor.spawn(callback, { name?: string, timeoutMs?: number });
@@ -177,42 +198,48 @@ const group = supervisor.createGroup({ strategy, retry?: { max, backoff, delayMs
 supervisor.terminateActor(actor.id);
 const unsub = supervisor.subscribe((msg) => { ... });
 await supervisor.shutdown();
-const diag = supervisor.getDiagnostics(); // Result<SupervisorDiagnostics, string>
+const diag = supervisor.getDiagnostics();
 ```
 
-### ActorRef API
+### ActorRef
 
 ```typescript
-actor.spawn(msg);                              // Send initial message
+actor.receive(msg);                                // Send a message to the actor
 const unsub = actor.subscribe((msg) => { ... }); // Subscribe to messages
-actor.terminate();                              // Terminate actor
-const reader = actor.read(msg);                // Read Tier 2 data, ChainableReader | null
-actor.release(handle);                         // Release shared memory box
-const diag = actor.getDiagnostics();           // Result<ActorDiagnostics, string>
-actor.link(otherActor);                        // Bi-directional link
-actor.monitor(otherActor);                     // Uni-directional monitor
+actor.terminate();                                // Kill the actor thread
+const reader = actor.read(msg);                  // Read Tier 2 data
+actor.release(handle);                           // Free shared memory box
+const diag = actor.getDiagnostics();
+actor.link(other);                               // Bi-directional link
+actor.monitor(other);                            // Uni-directional monitor
 ```
 
-### Context API
+### Message Dispatch
 
-See the [Context table](#context-ctx) above for the full API.
+```typescript
+matchAll(msg, {
+  progress: (m) => println("Progress:", m.data.percent),
+  result: (m) => handleResult(m),
+  _: () => {},  // Default handler for unmatched messages
+});
+```
 
 ## Constraints
 
 **Data Transfer:**
 - Arguments and return values must be cloneable (JSON-compatible or Uint8Array)
-- Large data should use Tier 2 (shared memory) rather than serialization
+- Large data should use Tier 2 shared memory instead of serialization
 - Resource methods must declare input and output validation schemas
 
 **Execution Model:**
-- Actor callbacks are serialized, outer scope is not available
+- Actor callbacks are serialized; outer scope is not available
 - All state must be passed via message or accessed through context
-- Heartbeat timeout defaults to 5000 milliseconds (configurable)
+- Heartbeat timeout defaults to 5000 milliseconds (configurable via `timeouts.defaultLeaseMs`)
 
 **Shared Memory:**
-- `ctx.write()` returns `Promise<Result<Lock, string>>`, handle with `result.isOk` check
-- `ctx.read(msg)` takes the full message, returns `ChainableReader | null`
-- `ctx.release(handle)` decrements ref count; box becomes FREE when count reaches 0
+- `ctx.write()` returns `Promise<Result<Lock, string>>`; handle with `result.isOk`
+- `ctx.read(msg)` takes the full message, returns `ChainableReader` or `null`
+- `ctx.release(handle)` decrements reference count; box becomes free when count reaches zero
 - Data is immutable after commit
 
 **Configuration Required:**

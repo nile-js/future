@@ -219,7 +219,7 @@ function createChildActorRef(childId: string): ActorRef {
   const throwCtx = () => { throw new Error("Not available in worker context"); };
   return {
     id: childId,
-    spawn: throwCtx,
+    receive: throwCtx,
     subscribe: throwCtx,
     terminate: () => postToMain({ type: "TERMINATE_CHILD", childId }),
     read: throwCtx,
