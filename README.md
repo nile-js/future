@@ -1,32 +1,30 @@
 # Future
 
-High-performance, system-level actor and tasks runtime for TypeScript, inspired by Erlang.
+Run code in parallel, safely. Isolated actors, zero-copy shared memory, and self-healing fault tolerance for TypeScript, inspired by Erlang.
 
-## Briefing
+## Why Future?
 
-You have seen a function hang forever. The event loop is blocked. Your server freezes. No request gets through. There is nothing you can do but wait for the process manager to kill the whole thing.
+You have a function that processes a file. It works. Then one day it hangs, not crashes, not throws, just sits there consuming memory and holding connections. The event loop is frozen. Your server stops responding. `AbortController` will not save you; it just stops you from waiting while the code keeps running in the background.
 
-`AbortController` does not help here. It ignores results while code keeps running. The thread is still stuck. Memory is still held. Cleanup never runs.
+In a standard JavaScript runtime, you have no way to stop it. No way to reclaim the memory. No way to know what went wrong. You restart the process and hope it does not happen again.
 
-Future gives you true termination. When you kill an actor, the worker thread dies. All resources are released. Other actors keep running. No shared state to corrupt. No cascading failure. The problem stops exactly when you say so.
+Future changes this. Every piece of work runs in its own thread with its own memory. If it hangs, you kill it. Not politely, the thread dies, memory is freed, and the rest of your system keeps running. You can do this from anywhere: a timeout, a user action, a monitoring signal. The actor stops, resources clean up, and nothing else is affected.
 
-## Core Concepts
+That is the core promise: **run anything, kill it anytime, clean up automatically**.
 
-A **supervisor** manages the entire actor system. It creates actors, monitors their health, handles failures, and owns the shared memory pool. You start here.
+## What You Can Build
 
-An **actor** is an isolated execution context running in its own thread. Actors do not share memory. They communicate via messages. Each actor has a unique ID, a message inbox, and lifecycle controlled by the supervisor.
+Future is not just actors. It is a complete concurrency toolkit:
 
-Actors can:
-- Send signals to subscribers via `self.send(msg, data?)` (Tier 1, lightweight)
-- Share large data via `ctx.write()` and `ctx.read()` (Tier 2, zero-copy shared memory)
-- Access main-thread resources through `ctx.resources` (proxy with schema validation)
-- Spawn child actors, link to other actors, monitor failures
-
-The supervisor enforces boundaries. Actors cannot access each other's memory directly. All communication goes through the supervisor's message routing and authorization layer.
+- **Parallel workloads**: Run hundreds of tasks simultaneously, each in its own thread. One slow task never blocks another.
+- **Shared memory at zero cost**: Pass large data between threads without copying. Write once, read from anywhere, no serialization overhead.
+- **Self-healing systems**: Actors fail, the supervisor restarts them. Link dependent actors so they recover together. Monitor what matters and react to failures.
+- **Safe resource access**: Workers call databases, APIs, and filesystems through a proxy that validates every input and output. Nothing touches the main thread directly.
+- **Dynamic actor trees**: Spawn child actors from inside workers. Build pipelines, fan-out/fan-in patterns, and supervision hierarchies that grow with your workload.
 
 ## Featured Example
 
-An actor performs computation that might hang. The supervisor spawns it, you send it work, and if it takes too long you terminate it. Resources clean up. Other actors are unaffected.
+An actor processes data. If it hangs, you terminate it. Resources clean up. Other actors are untouched.
 
 ```typescript
 import { createSupervisor, println, matchAll } from "@nilejs/future";
@@ -37,15 +35,15 @@ const supervisor = createSupervisor({
   timeouts: { defaultLeaseMs: 5000 },
 });
 
-// Spawn an actor that processes data
+// Spawn an actor that does real work
 const actor = supervisor.spawn(async (self, msg, ctx) => {
   self.send("started", { input: msg.input });
 
-  // Heavy computation (or external call that might hang)
+  // Heavy computation or external call that might hang
   const result = await fragileComputation(msg.input);
   const encoded = ctx.fmt.encode({ text: result });
 
-  // Write result to shared memory
+  // Write result to shared memory, zero-copy, single call
   const writeResult = await ctx.write({
     msg: "done",
     type: "json",
@@ -61,7 +59,7 @@ const actor = supervisor.spawn(async (self, msg, ctx) => {
 // Send work to the actor
 actor.receive({ input: "process me" });
 
-// Subscribe to results
+// Read results from the main thread
 actor.subscribe((msg) => {
   matchAll(msg, {
     started: (m) => println("Started:", m.data.input),
@@ -76,43 +74,33 @@ actor.subscribe((msg) => {
   });
 });
 
-// If it hangs, terminate on demand. Thread dies. Memory freed.
+// Hung after 3 seconds? Kill it. Everything else keeps running.
 setTimeout(() => actor.terminate(), 3000);
 ```
 
-Three guarantees hold: the actor stops immediately, its resources are freed, and all other actors continue unaffected.
+## How It Works
 
-## Quick Features
+Future uses two tiers of communication:
 
-- **True termination** via worker thread kill, not AbortController
-- **Two-tier communication**: lightweight Tier 1 signals plus zero-copy Tier 2 shared memory
-- **Supervision strategies**: one-for-one, one-for-all, rest-for-one
-- **Automatic lease expiry** for stalled actors
-- **Actor linking** (bi-directional) and **monitoring** (uni-directional)
-- **Schema-validated resource access** from workers via proxy
-- **Child actor spawning** from within worker callbacks
-- **Configurable diagnostics** with sampling and per-metric toggles
-- **No CAS, no atomic contention** on shared memory
+**Tier 1, Signals.** Lightweight messages via `postMessage`. Progress updates, heartbeats, task dispatch. Small, fast, JSON-encoded.
 
-## Erlang Inspiration
+**Tier 2, Shared memory.** Large data lives in `SharedArrayBuffer` segments. Workers write directly to their assigned box. The supervisor routes a handle to authorized readers. No serialization, no copying, no contention.
 
-Future draws from Erlang's proven concurrency model.
+When an actor finishes writing, it commits. The supervisor marks the box as ready and delivers a handle to every reader that is authorized to see it. Readers decode in place. When everyone is done, the box returns to the pool.
 
-**Let It Crash.** Actors fail independently. The supervisor handles recovery. Code does not guard every edge case.
+Every box has a lease. If an actor holds a box too long (crashed, hung, forgot to release), the supervisor forces it free. You can reset the lease with `ctx.heartbeat()` during long operations, or let the system handle it automatically on any interaction.
 
-**Supervision Trees.** Actors form hierarchies. A parent failure triggers strategy-driven cleanup of children.
+## Inspired by Erlang
 
-**Actor Isolation.** Each actor runs in its own thread. No shared memory corruption. No cross-actor state leaks.
+Future draws from three decades of battle-tested concurrency:
 
-**Linking.** Two linked actors share a failure bond. When one dies, the other terminates too.
+**Let it crash.** Do not wrap every call in try-catch. Let actors fail and let the supervisor decide what to do. Your code stays focused on the happy path.
 
-**Monitoring.** One actor watches another without linking. Receives a notification on death.
+**Supervision trees.** Actors form hierarchies. When one fails, the supervisor restarts it, restarts its siblings, or tears down the whole group, depending on the strategy you chose.
 
-Supervision strategies:
+**Isolation by default.** Actors share nothing. No shared mutable state, no race conditions, no locks. Communication happens through messages and immutable shared memory.
 
-- `one-for-one`: restart only the failed actor
-- `one-for-all`: restart all actors in the group
-- `rest-for-one`: restart the failed actor and all actors started after it
+**Linking and monitoring.** Link two actors and they die together, useful for tightly coupled dependencies. Monitor an actor and get a `DOWN` notification when it fails, useful for cleanup and logging.
 
 ## Install
 
@@ -122,13 +110,13 @@ npm install @nilejs/future
 
 **Requirements:** Bun v1.0+, TypeScript v4.5+
 
-Future is designed for the Bun runtime. The underlying APIs (worker threads, SharedArrayBuffer) exist in Node.js, but the library relies on Bun native TypeScript support and worker thread resolution for actor callback serialization. Node.js support is planned but not yet available.
+Future is designed for the Bun runtime. Node.js support is planned but not yet available.
 
 ## Core Concepts
 
 ### Supervisor
 
-Manages actor lifecycle, health monitoring, failure handling, memory pool, inbox routing, and supervision strategies.
+The orchestrator. It creates actors, monitors health, manages the memory pool, routes messages, and handles failures.
 
 ```typescript
 const supervisor = createSupervisor({
@@ -142,48 +130,48 @@ const supervisor = createSupervisor({
 
 ### Actor
 
-An isolated execution context in a separate thread. Each actor has its own memory and event loop.
+An isolated execution context in its own thread. Actors communicate through messages and shared memory, never through shared state.
 
 ```typescript
 const actor = supervisor.spawn(async (self, msg, ctx) => {
-  // self: actor control (send, terminate, receive)
-  // msg: incoming message
-  // ctx: execution context (resources, shared memory, formatting)
+  // self, send messages, terminate
+  // msg,  incoming message
+  // ctx,  shared memory, resources, formatting
 });
 ```
 
 ### Context
 
-Injected into every actor callback. Provides all runtime capabilities.
+Injected into every actor callback. Everything the actor needs:
 
-| Method | Tier | Description |
+| Method | Tier | What it does |
 |---|---|---|
-| `self.send(msg, data?)` | 1 | Send signal to subscribers |
-| `ctx.write({ msg, type, data, share? })` | 2 | Write data to shared memory, returns `Result<Lock, string>` |
-| `ctx.read(msg)` | 2 | Read shared memory data, returns `ChainableReader` or `null` |
-| `ctx.release(handle)` | 2 | Decrement reference count, box freed at zero |
-| `ctx.heartbeat()` | 1 | Reset lease timer during long operations |
-| `ctx.resources.*` | 1 | Access main-thread resources via proxy |
+| `self.send(msg, data?)` | 1 | Send a signal to subscribers |
+| `ctx.write({ msg, type, data, share? })` | 2 | Write to shared memory, returns `Result<Lock, string>` |
+| `ctx.read(msg)` | 2 | Read shared memory, returns `ChainableReader` or `null` |
+| `ctx.release(handle)` | 2 | Free a shared memory box |
+| `ctx.heartbeat()` | 1 | Reset the lease timer during long work |
+| `ctx.resources.*` | 1 | Call main-thread services through a proxy |
 | `ctx.link(actor)` | 1 | Bi-directional failure propagation |
-| `ctx.monitor(actor)` | 1 | Uni-directional notification on death |
-| `ctx.spawn(callback)` | 1 | Spawn a child actor from the worker |
-| `ctx.terminate()` | 1 | Terminate the actor |
-| `ctx.isCancelled` | 1 | Check if the actor was terminated |
-| `ctx.fmt.*` | N/A | Buffer allocation and serialization |
+| `ctx.monitor(actor)` | 1 | Get a `DOWN` notification when an actor dies |
+| `ctx.spawn(callback)` | 1 | Create a child actor from inside a worker |
+| `ctx.terminate()` | 1 | Stop the actor |
+| `ctx.isCancelled` | 1 | Check if the actor has been terminated |
+| `ctx.fmt.*` | n/a | Buffer allocation and serialization utilities |
 
-### Two-Tier Communication
+### Communication
 
-- **Tier 1 (Control):** lightweight signals via `postMessage`. Small messages, progress updates, heartbeats. `self.send("event", data)` with string key matching. `from` is auto-injected by the supervisor.
-- **Tier 2 (Data):** zero-copy shared memory via `SharedArrayBuffer`. Large data transfers without serialization. `ctx.write()` returns `Result<Lock, string>`. Data is immutable after commit.
+- **Tier 1 (Control):** `self.send("event", data)`, lightweight, JSON-encoded, auto-injects `from`
+- **Tier 2 (Data):** `ctx.write()` → `ctx.read()` → `ctx.release()`, zero-copy, ref-counted, immutable after commit
 
 ### Message Shape
 
 ```typescript
 type Message = {
-  readonly msg: string;       // Message key for dispatch
+  readonly msg: string;       // Dispatch key
   readonly type?: FmtType;    // "json" | "string" | "binary" | "cbor"
-  readonly data?: unknown;    // Tier 1: deserialized JSON data
-  readonly handle?: Lock;     // Tier 2: shared memory box reference
+  readonly data?: unknown;    // Tier 1 payload
+  readonly handle?: Lock;     // Tier 2 shared memory reference
   readonly from: ActorId;     // Auto-injected by supervisor
 };
 ```
@@ -205,13 +193,13 @@ const diag = supervisor.getDiagnostics();
 
 ```typescript
 actor.receive(msg);                                // Send a message to the actor
-const unsub = actor.subscribe((msg) => { ... }); // Subscribe to messages
-actor.terminate();                                // Kill the actor thread
-const reader = actor.read(msg);                  // Read Tier 2 data
-actor.release(handle);                           // Free shared memory box
+const unsub = actor.subscribe((msg) => { ... });  // Subscribe to messages
+actor.terminate();                                 // Kill the actor thread
+const reader = actor.read(msg);                   // Read Tier 2 data
+actor.release(handle);                            // Free shared memory box
 const diag = actor.getDiagnostics();
-actor.link(other);                               // Bi-directional link
-actor.monitor(other);                            // Uni-directional monitor
+actor.link(other);                                // Bi-directional link
+actor.monitor(other);                             // Uni-directional monitor
 ```
 
 ### Message Dispatch
@@ -220,66 +208,57 @@ actor.monitor(other);                            // Uni-directional monitor
 matchAll(msg, {
   progress: (m) => println("Progress:", m.data.percent),
   result: (m) => handleResult(m),
-  _: () => {},  // Default handler for unmatched messages
+  _: () => {},
 });
 ```
 
 ## Constraints
 
 **Data Transfer:**
-- Arguments and return values must be cloneable (JSON-compatible or Uint8Array)
+- Arguments and return values must be cloneable (JSON-compatible or `Uint8Array`)
 - Large data should use Tier 2 shared memory instead of serialization
 - Resource methods must declare input and output validation schemas
 
 **Execution Model:**
-- Actor callbacks are serialized; outer scope is not available
+- Actor callbacks are serialized, outer scope is not available
 - All state must be passed via message or accessed through context
-- Heartbeat timeout defaults to 5000 milliseconds (configurable via `timeouts.defaultLeaseMs`)
+- Heartbeat timeout defaults to 5000 milliseconds (configurable)
 
 **Shared Memory:**
-- `ctx.write()` returns `Promise<Result<Lock, string>>`; handle with `result.isOk`
-- `ctx.read(msg)` takes the full message, returns `ChainableReader` or `null`
-- `ctx.release(handle)` decrements reference count; box becomes free when count reaches zero
+- `ctx.write()` returns `Promise<Result<Lock, string>>`, check `result.isOk`
+- `ctx.read(msg)` returns `ChainableReader | null`, sync, zero-copy
+- `ctx.release(handle)` decrements the reference count; box frees at zero
 - Data is immutable after commit
-
-**Configuration Required:**
-- Memory pool requires explicit `poolSize` and `boxSize` configuration
-- Resources must define input and output schemas
-- Supervision strategy must be chosen for actor groups
 
 ## Use Cases
 
 **AI Agent Systems:**
-- Running agents that can hang or enter infinite loops
-- Sharing large context windows between agents
-- Managing multi-agent workflows with dependencies
-- Streaming token generation that must be interruptible
+- Run agents that can hang or loop infinitely, kill them on demand
+- Share large context windows between agents with zero-copy memory
+- Manage multi-agent workflows where one failure should not cascade
 
 **Data Processing Pipelines:**
-- Parallel transformation stages that should not block each other
-- ETL workflows requiring resilience to individual stage failures
-- Media processing (image, video, audio) with isolated actors
-- Real-time data enrichment with automatic cleanup
+- Parallel transformation stages that cannot block each other
+- ETL workflows that survive individual stage failures
+- Media processing with isolated actors and automatic cleanup
 
-**Background Job Processing:**
-- Jobs that can be cancelled on demand
-- Queue systems where job failures should not halt processing
+**Background Jobs:**
+- Cancellable jobs with guaranteed resource cleanup
+- Queue systems where one failure does not halt the pipeline
 - Long-running tasks with configurable timeout and retry
-- Resource cleanup guarantees when jobs complete or fail
 
-**Safe Code Execution:**
-- Running untrusted or unpredictable code
-- Plugins or extensions with limited trust
-- Sandboxed execution environments
-- Any scenario where hanging code must be killed safely
+**Sandboxed Execution:**
+- Run untrusted or unpredictable code safely
+- Plugins and extensions with limited trust
+- Any scenario where hanging code must be killed, not ignored
 
 ## Deep Dives
 
-- [Architecture](https://github.com/nile-js/future/blob/main/docs/architecture.md) -- Worker model, memory pool, state machine, performance
-- [Shared Memory](https://github.com/nile-js/future/blob/main/docs/shared-memory.md) -- Tier 2, write/read/release, authorization, lease system
-- [Supervision](https://github.com/nile-js/future/blob/main/docs/supervision.md) -- Strategies, groups, linking, monitoring, termination guarantees
-- [Diagnostics](https://github.com/nile-js/future/blob/main/docs/diagnostics.md) -- Configuration reference, sampling, metrics
-- [Resources](https://github.com/nile-js/future/blob/main/docs/resources.md) -- Intent relay, schema validation, cleanup hooks
+- [Architecture](https://github.com/nile-js/future/blob/main/docs/architecture.md) — Worker model, memory pool, state machine, performance
+- [Shared Memory](https://github.com/nile-js/future/blob/main/docs/shared-memory.md) — Tier 2, write/read/release, authorization, lease system
+- [Supervision](https://github.com/nile-js/future/blob/main/docs/supervision.md) — Strategies, groups, linking, monitoring, termination guarantees
+- [Diagnostics](https://github.com/nile-js/future/blob/main/docs/diagnostics.md) — Configuration reference, sampling, metrics
+- [Resources](https://github.com/nile-js/future/blob/main/docs/resources.md) — Intent relay, schema validation, cleanup hooks
 
 ## Contributing
 
