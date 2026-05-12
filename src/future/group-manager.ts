@@ -5,7 +5,7 @@ import type {
   ActorGroupConfig,
   GroupState,
 } from "./types";
-import { safeTry } from "../safe-try";
+import { safeTry } from "slang-ts";
 import {
   selectActorsToRestart,
   isRestartAllowed,

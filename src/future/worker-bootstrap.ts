@@ -6,9 +6,8 @@
  */
 
 import { parentPort, workerData } from "node:worker_threads";
-import { Ok, Err } from "../result";
-import { safeTry } from "../safe-try";
-import type { Result } from "../result";
+import { Ok, Err, safeTry } from "slang-ts";
+import type { Result } from "slang-ts";
 import type {
   ActorSelf, ActorContext, ActorCallback, ActorRef, FormatUtils,
   Lock, Message, WorkerInitPayload, WorkerSpawnPayload, SupervisorConfig,
@@ -130,7 +129,7 @@ function createResourcesProxy(): ActorContext["resources"] {
                 reject(`Resource request timeout: ${resource}.${method}`);
               }, timeout);
               pendingResourceRequests.set(id, { resolve, reject, timer });
-              postToMain({ type: "RESOURCE_REQUEST", id, resource, method, args });
+              postToMain({ type: "RESOURCE_REQUEST", id, resource, method, args: args[0] });
             }),
         },
       ),

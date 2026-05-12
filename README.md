@@ -29,29 +29,37 @@ const actor = supervisor.spawn(async (self, msg, ctx) => {
   // Tier 1: lightweight signal via postMessage (string key + optional data)
   self.send("progress", { percent: 0.5 });
 
-  // Tier 2: zero-copy shared memory write
-  const handle = await ctx.write({
+  // Tier 2: zero-copy shared memory write — returns Result<Lock, string>
+  const writeResult = await ctx.write({
     msg: "result",
     type: "json",
     data: ctx.fmt.encode({ text: result }),
     share: "owner",
   });
 
-  // Send the handle via Tier 1 so subscribers can read the Tier 2 data
-  self.send("done", { handle });
+  // Send handle to subscribers so they can read the Tier 2 data
+  if (writeResult.isOk) {
+    self.send("done", { handle: writeResult.value });
+  }
 });
 
 // Send initial message to the actor
 actor.spawn({ input: "hello future" });
 
 actor.subscribe((msg) => {
-  // Chainable reader API — sync, zero-copy read from shared memory
-  const reader = actor.read(msg);
-  if (reader) {
-    const value = reader.json();
-    println("Result:", value);
-    actor.release(msg.handle);
-  }
+  // matchAll dispatches on msg.msg field for message objects
+  matchAll(msg, {
+    progress: (m) => println("Progress:", m.data.percent),
+    done: (m) => {
+      // Chainable reader API — pass the full message, not just the handle
+      const reader = actor.read(m);
+      if (reader) {
+        println("Result:", reader.json());
+        actor.release(m.handle);
+      }
+    },
+    _: () => {},
+  });
 });
 ```
 
@@ -83,7 +91,10 @@ A supervisor is the orchestrator that manages actor lifecycle. It creates actors
 const supervisor = createSupervisor({
   maxActors: 10,
   memory: { poolSize: 5, boxSize: "1mb" },
+  timeouts: { defaultLeaseMs: 5000 },
   resources: { /* resource definitions */ },
+  strategy: "one-for-one",
+  retry: { max: 3, backoff: "exponential" },
 });
 ```
 
@@ -117,33 +128,33 @@ Each actor has:
 The context is injected into every actor callback. It provides everything the actor needs to function:
 
 ```typescript
-// Resources (proxy to main-thread services)
-ctx.resources.db.query({ sql: "SELECT * FROM users" });
+const actor = supervisor.spawn(async (self, msg, ctx) => {
+  // Resources (proxy to main-thread services)
+  const users = await ctx.resources.db.query({ sql: "SELECT * FROM users" });
 
-// Shared memory write — single async call, returns Lock
-const lock = await ctx.write({
-  msg: "result",
-  type: "json",
-  data: encodedData,
-  share: "group",
+  // Shared memory write — single async call, returns Result<Lock, string>
+  const result = await ctx.write({
+    msg: "result",
+    type: "json",
+    data: ctx.fmt.encode({ key: "value" }),
+    share: "group",
+  });
+
+  // Formatting utilities (no need to import)
+  const buffer = ctx.fmt.alloc(1024);
+  const encoded = ctx.fmt.encode({ key: "value" });
+
+  // Actor control
+  self.send("progress", { percent: 0.5 }); // Tier 1 signal
+  ctx.heartbeat();      // Keep lease alive during long operations
+  ctx.terminate();      // Terminate self
+  ctx.isCancelled;      // Check if terminated
+
+  // Spawn child actor
+  const child = await ctx.spawn(childCallback);
+  ctx.link(child);      // Bi-directional failure propagation
+  ctx.monitor(child);   // Uni-directional notification
 });
-
-// Shared memory read — sync, returns chainable decoder (pass full message, not lock)
-const reader = ctx.read(m);
-if (reader) {
-  const value = reader.json();
-  ctx.release(m.handle); // Decrements ref count, frees box at 0
-}
-
-// Formatting utilities (no need to import)
-const buffer = ctx.fmt.alloc(1024);
-const encoded = ctx.fmt.encode({ key: "value" });
-
-// Actor control
-self.send("progress", { percent: 0.5 }); // Tier 1 signal
-ctx.heartbeat();      // Keep lease alive during long operations
-ctx.terminate();      // Terminate self
-ctx.isCancelled;      // Check if terminated
 ```
 
 ### Communication: Two-Tier System
@@ -155,14 +166,12 @@ Communication happens in two tiers:
 - `self.send("eventName", data)` — string key matching with auto-encoded JSON data
 - `from` field auto-injected by supervisor (sender never sets it)
 - Resource method calls (intent relay)
-- PubSub pattern for subscribers
-- Per-actor inbox routing with authorization
 
 **Tier 2 (Data)**: Zero-copy shared memory
 - Large data transfers without serialization
-- `ctx.write()` — single call for write/commit, returns `Lock`
-- `ctx.read()` / `actor.read()` — sync, returns chainable decoder
-- `ctx.release()` — ref-counted cleanup, box becomes FREE when count reaches 0
+- `ctx.write()` — single call for write/commit, returns `Result<Lock, string>`
+- `ctx.read(msg)` / `actor.read(msg)` — sync, returns `ChainableReader | null`
+- `ctx.release(handle)` — ref-counted cleanup, box becomes FREE when count reaches 0
 - Immutable data after commit — no READING state, no CAS, no atomic contention
 
 ```typescript
@@ -170,12 +179,15 @@ Communication happens in two tiers:
 self.send("progress", { percent: 0.5 });
 
 // Tier 2: Share large data — single call
-const lock = await ctx.write({
+const result = await ctx.write({
   msg: "result",
   type: "json",
-  data: encodedLargeData,
+  data: ctx.fmt.encode({ large: "payload" }),
   share: "owner",
 });
+if (result.isOk) {
+  self.send("done", { handle: result.value });
+}
 ```
 
 ### Message Shape
@@ -184,11 +196,11 @@ All messages follow a standardized format:
 
 ```typescript
 type Message = {
-  msg: string;                // Message key (e.g., "result", "progress")
-  type?: FmtType;             // "json" | "string" | "binary" | "cbor"
-  data?: unknown;             // Tier 1: deserialized JSON data
-  handle?: Lock;              // Tier 2: reference to shared memory box
-  from: ActorId;              // Auto-injected by supervisor (always present)
+  readonly msg: string;           // Message key (e.g., "result", "progress")
+  readonly type?: FmtType;        // "json" | "string" | "binary" | "cbor"
+  readonly data?: unknown;        // Tier 1: deserialized JSON data
+  readonly handle?: Lock;         // Tier 2: reference to shared memory box
+  readonly from: ActorId;         // Auto-injected by supervisor (always present)
 };
 ```
 
@@ -203,8 +215,8 @@ A lock is a lightweight reference to a shared memory box:
 
 ```typescript
 type Lock = {
-  boxIndex: number;  // Index into the supervisor's BoxEntry array
-  epoch: number;     // Monotonically increasing — prevents use-after-free
+  readonly boxIndex: number;  // Index into the supervisor's BoxEntry array
+  readonly epoch: number;     // Monotonically increasing — prevents use-after-free
 };
 ```
 
@@ -221,11 +233,12 @@ if (reader) {
   const json = reader.json();
   const str = reader.string();
   const bin = reader.binary();
+  const cbor = reader.cbor();
   const raw = reader.raw(); // Raw Uint8Array
 }
 
 // Inside an actor callback (ctx.read takes the full message)
-const reader = ctx.read(m);
+const reader = ctx.read(msg);
 if (reader) {
   const value = reader.json();
 }
@@ -233,12 +246,14 @@ if (reader) {
 
 The reader API returns a decoder object with chainable format methods. All reads are zero-copy — they return views into the shared `Uint8Array` without allocating new buffers.
 
+If `msg.handle` is absent (Tier 1 message), `ctx.read(msg)` returns `null`.
+
 ### Send API
 
 ```typescript
 // self.send(msg, data?) — inside actor callback
-//   msg: string — message key for inbox routing
-//   data: optional — automatically JSON-encoded for Tier 1 delivery
+//   msg: string — message key for matchAll dispatch
+//   data: optional — automatically structured-cloned via postMessage
 self.send("progress", { percent: 0.5 });
 self.send("done");
 
@@ -246,7 +261,37 @@ self.send("done");
 actor.spawn({ input: "process this" });
 ```
 
-When `data` is provided, it is auto-encoded as JSON and delivered via Tier 1 (postMessage). For Tier 2 transfers, use `ctx.write()` and the supervisor routes the handle via INBOX to authorized readers.
+For Tier 2 transfers, use `ctx.write()` and the supervisor routes the handle via INBOX to authorized readers.
+
+### Message Dispatch with matchAll
+
+Use `matchAll` to dispatch on message types. It works with both primitives and message objects:
+
+```typescript
+import { matchAll } from "slang-ts";
+
+// Message objects — dispatches on msg.msg field
+actor.subscribe((msg) => {
+  matchAll(msg, {
+    progress: (m) => println("Progress:", m.data.percent),
+    done: (m) => {
+      const reader = actor.read(m);
+      if (reader) println("Result:", reader.json());
+      actor.release(m.handle);
+    },
+    _: () => {},
+  });
+});
+
+// Inside actor callback — dispatch on incoming message
+matchAll(msg, {
+  ingested: (m) => {
+    const data = ctx.read(m).json();
+    ctx.release(m.handle);
+  },
+  _: () => {},
+});
+```
 
 ## Key Features
 
@@ -307,15 +352,15 @@ type ShareConfig =
 
 ```typescript
 // Owner-only access (default)
-const lock = await ctx.write({
+const result = await ctx.write({
   msg: "private",
   type: "json",
-  data: sensitiveData,
+  data: ctx.fmt.encode(sensitiveData),
   share: "owner",
 });
 
 // Group-wide access
-const lock = await ctx.write({
+const result = await ctx.write({
   msg: "shared",
   type: "binary",
   data: teamData,
@@ -323,7 +368,7 @@ const lock = await ctx.write({
 });
 
 // Explicit allowlist
-const lock = await ctx.write({
+const result = await ctx.write({
   msg: "targeted",
   type: "cbor",
   data: targetedData,
@@ -331,7 +376,7 @@ const lock = await ctx.write({
 });
 ```
 
-The supervisor enforces authorization at the inbox routing layer. If an actor attempts to read a box it is not authorized for, the read is denied.
+The supervisor enforces authorization at the inbox routing layer. If an actor attempts to read a box it is not authorized for, the read is silently dropped.
 
 ## slang-ts Integration
 
@@ -339,7 +384,6 @@ The supervisor enforces authorization at the inbox routing layer. If an actor at
 
 ```typescript
 import { match, matchAll } from "slang-ts";
-import { println } from "@nilejs/future";
 
 // match instead of if/switch — for Result/Option types
 match(result, {
@@ -347,16 +391,16 @@ match(result, {
   Err: (e) => println("Error:", e.error),
 });
 
-// matchAll for tagged unions — for plain message objects
+// matchAll for message objects — dispatches on msg.msg field
 matchAll(msg, {
   progress: (m) => println("Progress:", m.data.percent),
-  done: (m) => println("Done, handle:", m.handle),
-  _: () => {},  // Default case
+  done: (m) => println("Done"),
+  _: () => {},
 });
 
 // Result types for explicit error handling
-const lockResult = await ctx.write({ msg: "r", type: "json", data });
-match(lockResult, {
+const writeResult = await ctx.write({ msg: "r", type: "json", data });
+match(writeResult, {
   Ok: (l) => { /* use lock */ },
   Err: (e) => println("Pool exhausted"),
 });
@@ -371,7 +415,6 @@ Resources are services available to actors but running on the main thread. The R
 ```typescript
 import { z } from "zod";
 
-// Assume `db` is your real database client (e.g., pg, drizzle, etc.)
 const supervisor = createSupervisor({
   resources: {
     database: {
@@ -392,7 +435,7 @@ const results = await ctx.resources.database.query({ sql: "SELECT 1" });
 How it works:
 1. Actor calls `ctx.resources.db.query(...)`
 2. Proxy intercepts and sends intent to main thread
-3. Main thread executes the handler
+3. Main thread validates with Zod, executes the handler
 4. Result is sent back to actor
 
 Benefits:
@@ -405,6 +448,7 @@ Benefits:
 
 ```typescript
 import { createSupervisor, println } from "@nilejs/future";
+import { matchAll } from "slang-ts";
 
 // Actor callbacks are serialized, outer scope is NOT available
 const config = { timeout: 5000 };
@@ -429,14 +473,16 @@ const actor = supervisor.spawn(async (self, msg, ctx) => {
   self.send("progress", { percent: 0.5 });
 
   // Tier 2: commit result to shared memory
-  const handle = await ctx.write({
+  const result = await ctx.write({
     msg: "result",
     type: "json",
     data: ctx.fmt.encode({ processed: true }),
     share: "owner",
   });
 
-  self.send("done", { handle });
+  if (result.isOk) {
+    self.send("done", { handle: result.value });
+  }
 });
 
 // Spawn with state
@@ -449,8 +495,7 @@ actor.subscribe((msg) => {
     done: (m) => {
       const reader = actor.read(m);
       if (reader) {
-        const result = reader.json();
-        println("Result:", result);
+        println("Result:", reader.json());
         actor.release(m.handle);
       }
     },
@@ -469,12 +514,41 @@ Actor termination in future kills the thread immediately. The execution stops ri
 
 Most libraries in TypeScript and JavaScript cannot do this. future and Effect-TS are among the few that support true on-demand termination of running code.
 
+## Termination Guarantees
+
+When an actor terminates, the following happens in order:
+
+1. **Worker thread killed** -- `worker.terminate()` stops the thread immediately. No cleanup hooks run inside the worker. Pending async operations are abandoned.
+2. **Boxes force-released** -- All shared memory boxes where the terminated actor is writer or reader are reset to FREE. Writer boxes are reclaimed immediately. Reader refs are decremented; boxes reaching zero refs are freed.
+3. **Inboxes cleared** -- The actor's per-actor inbox queue is removed. Undelivered messages are discarded.
+4. **Linked actors terminated** -- All actors linked via `ctx.link()` are recursively terminated with reason `linked_actor_died`. Termination cascades through the link graph.
+5. **Monitors notified** -- All actors monitoring the terminated actor receive a `DOWN` message with the terminated actor's ID and reason.
+6. **Write queue entries removed** -- Pending write queue requests from the terminated actor are filtered out. Remaining queued writes are served.
+7. **Group manager notified** -- If termination was not a clean shutdown, the group manager applies the supervision strategy (restart or cascade failure).
+
+```typescript
+// Termination triggered from anywhere:
+actor.terminate();                    // Main thread
+ctx.terminate();                      // Self-terminate inside actor
+supervisor.terminateActor(actor.id);  // Supervisor-level
+
+// Monitors receive a DOWN message:
+actor.subscribe((msg) => {
+  matchAll(msg, {
+    DOWN: (m) => console.log(`Actor ${m.data.id} died: ${m.data.reason}`),
+    _: () => {},
+  });
+});
+```
+
 ## Shared Memory
 
 Zero-copy data transfer between actors using write/read/release:
 
 ```typescript
-const producer = supervisor.spawn(async (self, msg, ctx) => {
+const pipeline = supervisor.createGroup({ strategy: "one-for-one" });
+
+const producer = pipeline.spawn(async (self, msg, ctx) => {
   const buffer = ctx.fmt.alloc(msg.size);
 
   // Write data directly to shared buffer — inline computation only
@@ -483,27 +557,32 @@ const producer = supervisor.spawn(async (self, msg, ctx) => {
   }
 
   // Single call: write, commit, and get a Lock reference
-  const handle = await ctx.write({
+  const result = await ctx.write({
     msg: "data",
     type: "binary",
     data: buffer,
-    share: "owner",
+    share: "group",  // Share with group members
   });
 
-  self.send("ready", { handle });
-});
-
-const consumer = supervisor.spawn(async (self, msg, ctx) => {
-  // When we receive a message with a handle, read synchronously
-  const reader = ctx.read(msg);
-  if (reader) {
-    const data = reader.raw();
-    println("Received", data.length, "bytes");
-    ctx.release(msg.handle);  // Release our reference
+  if (result.isOk) {
+    self.send("ready", { handle: result.value });
   }
 });
 
-producer.spawn({ size: 1000000 });
+const consumer = pipeline.spawn(async (self, msg, ctx) => {
+  // When we receive a message with a handle, read synchronously
+  matchAll(msg, {
+    data: () => {
+      const reader = ctx.read(msg);
+      if (reader) {
+        const bytes = reader.raw();
+        println("Received", bytes.length, "bytes");
+        ctx.release(msg.handle);
+      }
+    },
+    _: () => {},
+  });
+});
 ```
 
 Box lifecycle (3 states):
@@ -518,7 +597,7 @@ Immutable data after commit: once a box enters READY state, the data is never mo
 Resilient actor hierarchies:
 
 ```typescript
-import { matchAll } from "@nilejs/future";
+import { matchAll } from "slang-ts";
 
 const pipeline = supervisor.createGroup({
   strategy: "rest-for-one",  // Restart downstream on upstream failure
@@ -528,43 +607,252 @@ const pipeline = supervisor.createGroup({
 // Stage 1: Fetch data and write to Tier 2
 const ingest = pipeline.spawn(async (self, msg, ctx) => {
   const data = await ctx.resources.http.get({ url: msg.url });
-  const handle = await ctx.write({
+  const result = await ctx.write({
     msg: "ingested",
     type: "binary",
     data: data,
     share: "group",
   });
-  self.send("stage1_done", { handle });
+  if (result.isOk) {
+    self.send("stage1_done", { handle: result.value });
+  }
 });
 
 // Stage 2: Read from shared memory and transform
 const transform = pipeline.spawn(async (self, msg, ctx) => {
-  const reader = ctx.read(msg);
-  if (!reader) return;
-  const raw = reader.raw();
-  const transformed = raw.map((b) => b * 2);
-  ctx.release(msg.handle);  // Release input reference
-
-  const handle = await ctx.write({
-    msg: "transformed",
-    type: "binary",
-    data: transformed,
-    share: "group",
-  });
-  self.send("stage2_done", { handle });
-});
-
-// Main thread subscriber reads Tier 2 data
-ingest.subscribe((msg) => {
   matchAll(msg, {
-    stage1_done: (m) => {
-      // Forward the message to the next stage
-      transform.spawn(m);
+    ingested: (m) => {
+      const reader = ctx.read(m);
+      if (!reader) return;
+      const raw = reader.raw();
+      const transformed = raw.map((b) => b * 2);
+      ctx.release(m.handle);
+
+      ctx.write({
+        msg: "transformed",
+        type: "binary",
+        data: transformed,
+        share: "group",
+      }).then((writeResult) => {
+        if (writeResult.isOk) {
+          self.send("stage2_done", { handle: writeResult.value });
+        }
+      });
     },
     _: () => {},
   });
 });
 ```
+
+## Supervisor API
+
+```typescript
+// Spawn an actor
+const actor = supervisor.spawn(callback, { name: "my-actor" });
+
+// Create a supervision group
+const group = supervisor.createGroup({
+  strategy: "one-for-all",
+  retry: { max: 3, backoff: "exponential" },
+});
+
+// Terminate a specific actor by ID
+supervisor.terminateActor(actor.id);
+
+// Subscribe to all actor messages (system-wide)
+const unsub = supervisor.subscribe((msg) => { ... });
+
+// Graceful shutdown — terminates all actors, calls resource release hooks
+await supervisor.shutdown();
+
+// Get supervisor-level diagnostics
+const diag = supervisor.getDiagnostics();
+if (diag.isOk) {
+  console.log("Active actors:", diag.value.activeActors);
+  console.log("Pool utilization:", diag.value.memoryPool.utilization);
+}
+```
+
+## ActorRef API
+
+```typescript
+// Send initial message to actor
+actor.spawn({ input: "process this" });
+
+// Subscribe to actor messages
+const unsub = actor.subscribe((msg) => { ... });
+
+// Terminate actor immediately
+actor.terminate();
+
+// Read Tier 2 data from message — returns ChainableReader | null
+const reader = actor.read(msg);
+if (reader) {
+  const data = reader.json();
+  actor.release(msg.handle);
+}
+
+// Get per-actor diagnostics
+const diag = actor.getDiagnostics();
+
+// Link (bi-directional) or monitor (uni-directional)
+actor.link(otherActor);
+actor.monitor(otherActor);
+```
+
+## Context API (inside actor callbacks)
+
+| Method | Tier | Description |
+|---|---|---|
+| `self.send(msg, data?)` | 1 | Send signal/status to subscribers. Auto-injects `from`. |
+| `ctx.write({ msg, type, data, share? })` | 2 | Write data to SAB. Returns `Result<Lock, string>`. |
+| `ctx.read(msg)` | 2 | Read SAB data from message. Returns `ChainableReader \| null`. |
+| `ctx.release(handle)` | 2 | Decrement ref count. If 0 then FREE. |
+| `ctx.heartbeat()` | 1 | Explicitly reset lease timer during CPU-intensive loops. |
+| `ctx.resources.*` | 1 | Access resources via Proxy. Calls go through intent relay. |
+| `ctx.link(actor)` | 1 | Create bi-directional link. If either dies, both die. |
+| `ctx.monitor(actor)` | 1 | Create uni-directional monitor. Receive notification when actor dies. |
+| `ctx.spawn(callback)` | 1 | Spawn a child actor. |
+| `ctx.terminate()` | 1 | Terminate the actor gracefully. |
+| `ctx.isCancelled` | 1 | Check if actor has been terminated. |
+| `ctx.fmt.*` | N/A | Buffer allocation and serialization utilities. |
+
+### Child Actor Operations
+
+Inside an actor callback, `ctx.spawn()` creates a child actor in a new worker thread:
+
+```typescript
+const child = await ctx.spawn(async (selfChild, msgChild, ctxChild) => {
+  matchAll(msgChild, {
+    task: (m) => {
+      const result = (m.data as number) * 2;
+      selfChild.send("done", { value: result });
+    },
+    _: () => {},
+  });
+});
+
+self.send("child_spawned", { childId: child.id });
+child.spawn({ value: 42 });  // Send initial message to child
+```
+
+The child `ActorRef` from `ctx.spawn()` has limited API in worker context -- `spawn()`, `terminate()`, `link()`, and `monitor()` work; `subscribe()`, `read()`, and `release()` throw `Not available in worker context`.
+
+**Linking** creates a bi-directional suicide pact -- when either linked actor dies, the other is terminated immediately:
+
+```typescript
+ctx.link(child);  // Each dies if the other dies
+```
+
+**Monitoring** is uni-directional notification -- the monitor receives `DOWN` when the monitored actor terminates, but the monitored actor is unaffected:
+
+```typescript
+ctx.monitor(child);  // Receive DOWN when child dies
+
+// Subscribe handler receives:
+matchAll(msg, {
+  DOWN: (m) => console.log(`Actor ${m.data.id} died: ${m.data.reason}`),
+  _: () => {},
+});
+```
+
+Main-thread equivalents via `ActorRef`:
+
+```typescript
+actorA.link(actorB);      // Bi-directional termination propagation
+actorA.monitor(actorB);   // Uni-directional monitoring
+```
+
+Under the hood, `handleLink` adds each actor ID to the other's `linkedActors` set. `handleMonitor` only adds to the monitor's `monitoredActors` set. On termination, all linked actors are recursively terminated, and every subscriber of monitoring actors receives a `DOWN` message.
+
+## Buffer & Serialization (ctx.fmt)
+
+```typescript
+// Allocate buffers
+const buf = ctx.fmt.alloc(1024);
+const u8 = ctx.fmt.alloc.u8(256);
+const i32 = ctx.fmt.alloc.i32(64);
+const f64 = ctx.fmt.alloc.f64(32);
+
+// Auto-detect encoding
+const encoded = ctx.fmt.encode({ key: "value" });  // object → JSON bytes
+const decoded = ctx.fmt.decode(encoded);             // bytes → object
+
+// Create buffer from data
+const buf = ctx.fmt.from("hello");           // string → UTF-8 bytes
+const buf = ctx.fmt.from({ name: "kizz" });  // object → JSON bytes
+
+// Explicit codecs
+const json = ctx.fmt.json.encode({ a: 1 });
+const obj = ctx.fmt.json.decode(json);
+const str = ctx.fmt.string.encode("hello");
+const text = ctx.fmt.string.decode(str);
+// CBOR is available if configured (throws by default)
+```
+
+## Diagnostics
+
+```typescript
+const supervisor = createSupervisor({
+  diagnostics: {
+    enabled: true,
+    sampleRate: 1.0,  // 0.0-1.0, 1.0 = 100%
+    track: {
+      actorLifetimes: true,
+      writeQueueDepth: true,
+      bufferUtilization: true,
+      authorizationEvents: true,
+      inboxDepth: true,
+      resourceCallLatency: true,
+    },
+  },
+});
+
+// Periodic reporting
+setInterval(() => {
+  const stats = supervisor.getDiagnostics();
+  if (stats.isOk) {
+    console.log("Active:", stats.value.activeActors);
+    console.log("Pool:", stats.value.memoryPool);
+  }
+}, 5000);
+
+// Per-actor diagnostics
+const diag = actor.getDiagnostics();
+if (diag.isOk) {
+  console.log(`Lifetime: ${diag.value.lifetimeMs}ms`);
+  console.log(`Heartbeats: ${diag.value.heartbeatCount}`);
+}
+```
+
+### Diagnostics Configuration Reference
+
+All available per-metric toggles:
+
+```typescript
+const supervisor = createSupervisor({
+  diagnostics: {
+    enabled: true,
+    sampleRate: 0.5,  // 0.0-1.0, gates tracking via Math.random() < sampleRate
+    track: {
+      actorLifetimes: true,      // Actor start/stop timestamps
+      startTimes: true,           // Actor creation time
+      processLifetimes: true,     // Worker thread uptime
+      writeQueueWait: true,       // Box allocation wait time
+      writeQueueDepth: true,      // Pending write queue length
+      messageLatency: true,       // Send-to-receive latency
+      bufferUtilization: true,    // Memory pool usage
+      heartbeatIntervals: true,   // Time between heartbeats
+      resourceCallLatency: true,  // Resource handler duration
+      authorizationEvents: true,  // Granted vs denied reads
+      inboxDepth: true,           // Per-actor inbox queue size
+      refCountHistory: true,      // Box reference count history
+    },
+  },
+});
+```
+
+Diagnostics are zero-cost when disabled (`enabled: false` produces a no-op collector). The `sampleRate` gates tracking via `Math.random() < sampleRate`, reducing overhead at scale by sampling a fraction of events. When a metric is omitted from `track`, it is not collected regardless of `sampleRate`.
 
 ## Constraints
 
@@ -578,12 +866,12 @@ When using future, keep these constraints in mind:
 **Execution Model**
 - Actor callbacks are serialized, outer scope is not available
 - All state must be passed via message or accessed through context
-- `self.send(msg, data?)` — msg is a string key, data is optional and auto-encoded as JSON
+- `self.send(msg, data?)` — msg is a string key, data is optional
 - Heartbeat timeout defaults to 5000 milliseconds (configurable)
 
 **Shared Memory**
-- `ctx.write()` returns `Promise<Result<Lock, string>>` — single call for write/commit
-- `ctx.read(m)` takes the full message, returns `ChainableReader | null` — sync, chainable
+- `ctx.write()` returns `Promise<Result<Lock, string>>` — handle with `result.isOk` check
+- `ctx.read(msg)` takes the full message, returns `ChainableReader | null` — sync, chainable
 - `ctx.release(handle)` decrements ref count; box becomes FREE when count reaches 0
 - Data is immutable after commit — no in-place mutations
 

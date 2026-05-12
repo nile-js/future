@@ -18,8 +18,8 @@ High-performance actor/promise primitives for **Bun**, Erlang-inspired. Isolates
 | `src/future/group-manager.ts` | Group state tracking + auto-restart |
 | `src/future/diagnostics.ts` | Configurable metrics collector with sampling |
 | `src/future/index.ts` | Barrel export for future domain |
-| `src/index.ts` | Barrel export for slang utilities |
-| `index.ts` | Root entry — exports future + slang |
+| `src/index.ts` | Re-exports slang-ts |
+| `index.ts` | Root entry — exports future + slang-ts |
 
 ## Conventions
 - **No classes**. Factory functions only. `createSupervisor()` returns plain object with methods.
@@ -33,9 +33,9 @@ High-performance actor/promise primitives for **Bun**, Erlang-inspired. Isolates
 - **Domain folders with barrel `index.ts`**.
 
 ## Dependencies
+- `slang-ts` — Result, Option, match, matchAll, safeTry, pipe, atom, println, panic
 - `zod` — resource schema validation
 - `node:worker_threads` — worker threads (Bun has full compatibility)
-- Existing slang utilities in `src/` — Result, Option, match, safeTry, pipe, atom
 
 ## Architecture
 
@@ -75,14 +75,9 @@ type Message = {
 ```typescript
 type BoxEntry = {
   state: "FREE" | "WRITING" | "READY";
-  from: ActorId;
-  msg: string;
-  type: FmtType;
-  share: ShareConfig;
-  refCount: number;
-  expiresAt: number;
-  writer: ActorId | null;
-  readers: Set<ActorId>;
+  from: ActorId; msg: string; type: FmtType; share: ShareConfig;
+  refCount: number; expiresAt: number; writer: ActorId | null;
+  readers: Set<ActorId>; epoch: number;
 };
 ```
 
@@ -121,12 +116,8 @@ All state transitions are deterministic and managed by the supervisor in respons
 ### Per-Actor Inbox
 ```typescript
 type InboxEntry = {
-  handle: Lock;
-  from: ActorId;
-  msg: string;
-  type: FmtType;
+  handle: Lock; from: ActorId; msg: string; type: FmtType;
 };
-
 const inboxes: Map<ActorId, InboxEntry[]>;
 ```
 - Supervisor routes messages to actor inboxes based on `share` authorization
@@ -177,37 +168,17 @@ const inboxes: Map<ActorId, InboxEntry[]>;
 - Linking = bi-directional suicide pact. Monitoring = uni-directional notification.
 - **Max actors**: Enforced at spawn time.
 - **`self.send(msg, data)`**: Tier 1. `msg` is string matching key. `data` auto-encoded as JSON. `from` auto-injected by supervisor.
-- **`ctx.write({ msg, type, data, share })`**: Tier 2. Single async call. Returns `Promise<Lock>`. Data is `Uint8Array`. Immutable after commit.
+- **`ctx.write({ msg, type, data, share })`**: Tier 2. Single async call. Returns `Result<Lock, string>`. Data is `Uint8Array`. Immutable after commit.
 - **`ctx.read(m)`**: Returns chainable decoder `{ json(), string(), binary(), cbor(), raw() }` or `null`. Zero-copy from SAB. No async.
 - **`ctx.release(handle)`**: Decrements ref count. If 0 → FREE.
 - **`from` is always auto-injected** by supervisor. Sender never sets it.
-
-## API Changes (Old → New)
-| Old API | New API | Notes |
-|---------|---------|-------|
-| `ctx.acquireLock()` | `ctx.write({ msg, type, data, share })` | Write replaces acquire+deposit+done |
-| `ctx.deposit(lock, data)` | (merged into `ctx.write`) | Data passed in write call |
-| `ctx.done(lock)` | (merged into `ctx.write`) | Commit is implicit after SAB copy |
-| `ctx.read(lock)` (async) | `ctx.read(m)` (sync, chainable) | Returns decoder, no async round-trip |
-| `actor.read(lock)` (sync) | `actor.read(m)` (sync, chainable) | Returns decoder or null |
-| `actor.done(lock)` | `actor.release(handle)` / `ctx.release(handle)` | Decrements ref count |
-| `LOCK_REQUEST/LOCK_GRANTED` | `WRITE_REQUEST/WRITE_GRANTED` | Protocol rename |
-| `DEPOSIT` | (removed) | Merged into write flow |
-| `DONE` | `COMMIT` | Protocol rename |
-| `READ_START/READ_GRANTED/READ_ERROR` | (removed) | No async read. Data is immutable in SAB. |
-| `READING` state | (removed) | No READING state. READY is immutable. |
-| State Board (`Int32Array`) | (removed) | State tracked in `BoxEntry[]` plain objects |
-| Lease Tracker (`BigInt64Array`) | (removed) | `expiresAt` in `BoxEntry` |
-| `Lock { boxIndex, byteOffset, length }` | `Lock { boxIndex, epoch }` | Epoch prevents use-after-free |
-| `self.send(msg)` | `self.send(msg, data?)` | Now takes optional data param |
-| Open read model | `ShareConfig` authorization | owner/group/linked/explicit list |
-| No inbox | Per-actor inbox queue | Supervisor routes to authorized readers |
+- **`matchAll(msg, { key: (m) => ... })`**: Works on message objects — dispatches on `msg.msg` field, passes full message to handler.
 
 ## Testing
 - **Use `bun test`**. Bun has native TypeScript support in worker threads.
 - Tests in `tests/future/*.spec.ts` for future features.
-- Keep existing `tests/*.spec.ts` for slang utilities.
-- **355 tests pass, 0 fail.** (Memory pool: 27 tests. Supervisor: 46 tests. Slang utilities: unchanged.)
+- Tests in `tests/*.spec.ts` for slang-ts utilities (re-exported).
+- **739 tests pass, 0 fail.**
 
 ## Runtime Requirement
 - **Bun v1.0+ only**. Node.js is not supported.
@@ -215,9 +186,8 @@ const inboxes: Map<ActorId, InboxEntry[]>;
 - If Node.js support is needed, it requires a pre-compiled worker bootstrap or `tsx` loader — not currently implemented.
 
 ## Documentation Status
-- `README.md` — Needs update for new API
-- `spec-final.md` — Current (1400 lines, 20 sections, 8 ADRs). Rewrite complete.
-- `spec.md` — Deprecated (superseded by spec-final.md)
+- `README.md` — Current. All examples match actual API.
+- `spec-final.md` — Canonical spec (1400 lines, 20 sections, 8 ADRs).
 - `docs/ADR-006-bun-only-runtime.md` — Current
 - `context.md` — Current (this file)
 
@@ -226,8 +196,17 @@ const inboxes: Map<ActorId, InboxEntry[]>;
 - `actor.read(m)` on main thread returns zero-copy SAB view. Caller must call `actor.release(handle)` after reading. Enables concurrent readers.
 - Epoch-based Lock prevents use-after-free but adds small overhead on box recycling.
 - Write queue blocks requesting worker until a FREE box available. If all boxes busy, writer stalls. Mitigate with sufficient `poolSize`.
-- No bounds validation on `lock.boxIndex` in RELEASE handler. Out-of-range indices should be guarded.
-- `(msg as any)` casts in message handlers bypass TypeScript strictness. Technical debt, not a runtime bug.
+- CBOR codec not implemented — throws on use. Can be configured via `codecs` in supervisor config.
+- `ctx.fmt.alloc()` creates heap buffers (not SAB-backed). Data is copied into SAB on `ctx.write()`. JSDoc corrected.
+- Resource proxy sends `args[0]` (first argument) to `resourceManager.execute`, not the rest array. Fixed from original `args` spread.
+
+## Recent Changes
+- Fixed owner-share refCount leak: `readers.delete(actorId)` in handleCommit excludes writer from readers set
+- Fixed resource proxy args bug: `args` → `args[0]` in worker-bootstrap.ts RESOURCE_REQUEST
+- Fixed misleading fmt.alloc JSDoc: "SAB-backed" → "heap buffers (copied into SAB on write)"
+- Added integration tests: explicit heartbeat, implicit heartbeat, ctx.resources, ctx.spawn, callback validation, linked authorization, per-actor timeouts, resource cleanup on shutdown
+- Added README sections: Termination Guarantees, Child Actor Operations (ctx.spawn/link/monitor), Diagnostics Configuration Reference
+- Added Teamwork Philosophy and Delegation Protocol to AGENTS.md
 
 ## Boundaries (DO NOT CROSS)
 - `/backend`, `/nile`, `frontend/api` — never touch

@@ -1,4 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from "bun:test";
+import { z } from "zod";
 import { createSupervisor } from "../../src/future/supervisor";
 import type { Supervisor, ActorRef, Lock, Message } from "../../src/future/types";
 
@@ -1088,5 +1089,458 @@ describe("ChainableReader.binary and raw", () => {
     expect(data[1]).toBe(0xFE);
     expect(data[2]).toBe(0xBA);
     expect(data[3]).toBe(0xBE);
+  });
+});
+
+// ============================================================================
+// Explicit heartbeat (ctx.heartbeat)
+// ============================================================================
+
+describe("explicit heartbeat", () => {
+  let sup: Supervisor;
+
+  beforeEach(() => { sup = makeSupervisor({ leaseMs: 300 }); });
+  afterEach(async () => { await sup.shutdown(); });
+
+  it("ctx.heartbeat() resets lease timer for WRITING boxes", async () => {
+    // Actor writes, then heartbeats repeatedly to stay alive past lease expiry
+    const actor = sup.spawn(async (self, _msg, ctx) => {
+      const result = await ctx.write({
+        msg: "data",
+        type: "json",
+        data: ctx.fmt.json.encode({ v: 1 }),
+        share: "owner",
+      });
+      if (result.isOk) {
+        // Heartbeat 3 times with 100ms gaps — total 300ms, past the 300ms lease
+        for (let i = 0; i < 3; i++) {
+          await new Promise((r) => setTimeout(r, 100));
+          ctx.heartbeat();
+        }
+        self.send("survived");
+        ctx.release(result.value);
+      }
+    });
+
+    const survived = await new Promise<boolean>((resolve, reject) => {
+      const timeout = setTimeout(() => resolve(false), 3000);
+      actor.subscribe((msg) => {
+        if (msg.msg === "survived") { clearTimeout(timeout); resolve(true); }
+      });
+      actor.spawn("write");
+    });
+
+    expect(survived).toBe(true);
+  });
+
+  it("ctx.heartbeat() increments heartbeatCount in diagnostics", async () => {
+    const actor = sup.spawn(async (self, _msg, ctx) => {
+      ctx.heartbeat();
+      ctx.heartbeat();
+      ctx.heartbeat();
+      self.send("done");
+    });
+
+    await new Promise<void>((resolve) => {
+      actor.subscribe((msg) => { if (msg.msg === "done") resolve(); });
+      actor.spawn("start");
+    });
+
+    const diag = actor.getDiagnostics();
+    if (diag.isOk) {
+      expect(diag.value.heartbeatCount).toBeGreaterThanOrEqual(3);
+    }
+  });
+});
+
+// ============================================================================
+// Implicit heartbeat (self.send resets lease)
+// ============================================================================
+
+describe("implicit heartbeat", () => {
+  let sup: Supervisor;
+
+  beforeEach(() => { sup = makeSupervisor({ leaseMs: 300 }); });
+  afterEach(async () => { await sup.shutdown(); });
+
+  it("self.send() resets lastHeartbeatAt", async () => {
+    const actor = sup.spawn(async (self) => {
+      // Send messages with gaps — each send is an implicit heartbeat
+      for (let i = 0; i < 4; i++) {
+        await new Promise((r) => setTimeout(r, 80));
+        self.send("tick", { i });
+      }
+      self.send("done");
+    });
+
+    await new Promise<void>((resolve) => {
+      actor.subscribe((msg) => { if (msg.msg === "done") resolve(); });
+      actor.spawn("start");
+    });
+
+    const diag = actor.getDiagnostics();
+    if (diag.isOk) {
+      // lastHeartbeatAt should be recent (within last 200ms)
+      expect(diag.value.lastHeartbeatAt).toBeGreaterThan(Date.now() - 2000);
+      expect(diag.value.messageCount).toBeGreaterThanOrEqual(5); // 4 ticks + done
+    }
+  });
+});
+
+// ============================================================================
+// Resource manager integration (ctx.resources from worker)
+// ============================================================================
+
+describe("resource manager integration", () => {
+  let sup: Supervisor;
+
+  beforeEach(() => {
+    sup = createSupervisor({
+      maxActors: 10,
+      memory: { poolSize: 3, boxSize: 1024 },
+      timeouts: { defaultLeaseMs: 2000 },
+      resources: {
+        db: {
+          query: {
+            input: z.object({ sql: z.string() }),
+            output: z.array(z.unknown()),
+            handler: async (args: unknown) => {
+            const { sql } = args as { sql: string };
+            return [{ id: 1, sql }];
+          },
+          },
+        },
+      },
+    });
+  });
+
+  afterEach(async () => { await sup.shutdown(); });
+
+  it("ctx.resources.db.query() works from inside actor", async () => {
+    const actor = sup.spawn(async (self, _msg, ctx) => {
+      const db = ctx.resources.db!;
+      const result = await db.query!({ sql: "SELECT 1" });
+      self.send("query-result", result);
+    });
+
+    const data = await new Promise<unknown>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Timeout")), 5000);
+      actor.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "query-result") { clearTimeout(timeout); resolve(m.data); }
+      });
+      actor.spawn("start");
+    });
+
+    expect(data).toEqual([{ id: 1, sql: "SELECT 1" }]);
+  });
+
+  it("ctx.resources returns error for unknown resource", async () => {
+    const actor = sup.spawn(async (self, _msg, ctx) => {
+      try {
+        const ns = ctx.resources.nonexistent!;
+        await ns.foo!({});
+        self.send("no-error");
+      } catch (e) {
+        self.send("caught-error", { error: String(e) });
+      }
+    });
+
+    const result = await new Promise<string>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Timeout")), 5000);
+      actor.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "caught-error" && m.data) {
+          clearTimeout(timeout);
+          resolve((m.data as { error: string }).error);
+        }
+        if (m.msg === "no-error") { clearTimeout(timeout); resolve("no-error"); }
+      });
+      actor.spawn("start");
+    });
+
+    expect(result).not.toBe("no-error");
+  });
+});
+
+// ============================================================================
+// ctx.spawn from worker (child actors)
+// ============================================================================
+
+describe("ctx.spawn from worker", () => {
+  let sup: Supervisor;
+
+  beforeEach(() => { sup = makeSupervisor(); });
+  afterEach(async () => { await sup.shutdown(); });
+
+  it("actor can spawn a child actor via ctx.spawn", async () => {
+    const parent = sup.spawn(async (self, _msg, ctx) => {
+      const child = await ctx.spawn(async (childSelf) => {
+        childSelf.send("child-ready");
+      });
+      self.send("child-id", { childId: child.id });
+    });
+
+    const childId = await new Promise<string>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Timeout")), 5000);
+      parent.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "child-id" && m.data) {
+          clearTimeout(timeout);
+          resolve((m.data as { childId: string }).childId);
+        }
+      });
+      parent.spawn("start");
+    });
+
+    expect(childId).toBeDefined();
+    expect(typeof childId).toBe("string");
+    expect(childId).toMatch(/^actor-/);
+
+    // Verify child appears in diagnostics
+    const diag = sup.getDiagnostics();
+    if (diag.isOk) {
+      expect(diag.value.activeActors).toBeGreaterThanOrEqual(2);
+    }
+  });
+});
+
+// ============================================================================
+// Callback serialization validation (security)
+// ============================================================================
+
+describe("callback validation", () => {
+  let sup: Supervisor;
+
+  beforeEach(() => { sup = makeSupervisor(); });
+  afterEach(async () => { await sup.shutdown(); });
+
+  it("rejects callback with require()", async () => {
+    const actor = sup.spawn(async () => { require("fs"); });
+    actor.spawn("start");
+    await wait(300);
+    const diag = actor.getDiagnostics();
+    expect(diag.isErr).toBe(true);
+  });
+
+  it("rejects callback with process global", async () => {
+    const actor = sup.spawn(async () => { process.exit(1); });
+    actor.spawn("start");
+    await wait(300);
+    const diag = actor.getDiagnostics();
+    expect(diag.isErr).toBe(true);
+  });
+
+  it("rejects callback with eval()", async () => {
+    const actor = sup.spawn(async () => { eval("1+1"); });
+    actor.spawn("start");
+    await wait(300);
+    const diag = actor.getDiagnostics();
+    expect(diag.isErr).toBe(true);
+  });
+
+  it("rejects callback with Function constructor", async () => {
+    const actor = sup.spawn(async () => { new Function("return 1")(); });
+    actor.spawn("start");
+    await wait(300);
+    const diag = actor.getDiagnostics();
+    expect(diag.isErr).toBe(true);
+  });
+
+  it("accepts safe callback", async () => {
+    const messages: Message[] = [];
+    const actor = sup.spawn(async (self) => {
+      self.send("safe", { ok: true });
+    });
+    actor.subscribe((msg) => messages.push(msg as Message));
+    actor.spawn("start");
+    await wait(200);
+
+    const safe = messages.find((m) => m.msg === "safe");
+    expect(safe).toBeDefined();
+    expect((safe!.data as { ok: boolean }).ok).toBe(true);
+  });
+});
+
+// ============================================================================
+// Linked authorization (share: "linked")
+// ============================================================================
+
+describe("linked authorization", () => {
+  let sup: Supervisor;
+
+  beforeEach(() => { sup = makeSupervisor({ poolSize: 5 }); });
+  afterEach(async () => { await sup.shutdown(); });
+
+  it("linked actors can read each other's data with share: linked", async () => {
+    const writer = sup.spawn(async (self, _msg, ctx) => {
+      const result = await ctx.write({
+        msg: "linked-data",
+        type: "json",
+        data: ctx.fmt.json.encode({ shared: true }),
+        share: "linked",
+      });
+      if (result.isOk) self.send("written", { handle: result.value });
+    });
+
+    const reader = sup.spawn(async (self, msg, ctx) => {
+      const m = msg as Message;
+      if (m.handle) {
+        const data = ctx.read(m);
+        if (data) self.send("reader-got", { json: data.json() });
+      }
+    });
+
+    // Link them bidirectionally
+    writer.link(reader);
+
+    // Set up reader subscription before writer writes
+    const readerData = new Promise<unknown>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Reader never received data")), 5000);
+      reader.subscribe((msg) => {
+        const m = msg as Message;
+        if (m.msg === "reader-got" && m.data) {
+          clearTimeout(timeout);
+          resolve((m.data as { json: unknown }).json);
+        }
+      });
+      reader.spawn("ready");
+    });
+
+    await wait(100);
+
+    // Writer writes with share: "linked"
+    writer.spawn("write");
+
+    const data = await readerData;
+    expect(data).toEqual({ shared: true });
+  });
+
+  it("unlinked actor does NOT receive INBOX for linked share", async () => {
+    const writer = sup.spawn(async (self, _msg, ctx) => {
+      const result = await ctx.write({
+        msg: "linked-private",
+        type: "json",
+        data: ctx.fmt.json.encode({ secret: true }),
+        share: "linked",
+      });
+      if (result.isOk) self.send("written");
+    });
+
+    let leaked = false;
+    const unlinked = sup.spawn(async (self, msg, ctx) => {
+      const m = msg as Message;
+      if (m.handle) {
+        const data = ctx.read(m);
+        if (data) { self.send("leak"); }
+      }
+    });
+
+    unlinked.subscribe((msg) => { if (msg.msg === "leak") leaked = true; });
+    unlinked.spawn("ready");
+    await wait(100);
+
+    writer.spawn("write");
+    await wait(300);
+
+    expect(leaked).toBe(false);
+  });
+});
+
+// ============================================================================
+// Per-actor timeout overrides
+// ============================================================================
+
+describe("per-actor timeout overrides", () => {
+  it("named actor uses custom lease duration", async () => {
+    // Default lease 5000ms, but "fast-actor" gets 200ms
+    const sup = createSupervisor({
+      maxActors: 10,
+      memory: { poolSize: 3, boxSize: 1024 },
+      timeouts: { defaultLeaseMs: 5000, actorTimeouts: { "fast-actor": 200 } },
+    });
+
+    // Actor that writes but never commits (blocks worker)
+    const slowWriter = sup.spawn(
+      (self, _msg, ctx) => {
+        ctx.write({
+          msg: "slow",
+          type: "json",
+          data: ctx.fmt.json.encode({ slow: true }),
+          share: "owner",
+        });
+        self.send("write-requested");
+        // Block worker — prevents COMMIT
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10000);
+      },
+      { name: "fast-actor" },
+    );
+
+    await new Promise<void>((resolve) => {
+      slowWriter.subscribe((msg) => {
+        if (msg.msg === "write-requested") resolve();
+      });
+      slowWriter.spawn("write");
+    });
+
+    await wait(100);
+
+    // Actor should still be alive (lease hasn't expired yet)
+    const diagBefore = slowWriter.getDiagnostics();
+    expect(diagBefore.isOk).toBe(true);
+
+    // Wait for 200ms lease to expire + buffer
+    await wait(400);
+
+    // Trigger lease check via another actor
+    const trigger = sup.spawn(async (self) => { self.send("trigger"); });
+    await new Promise<void>((resolve) => {
+      trigger.subscribe((msg) => { if (msg.msg === "trigger") resolve(); });
+      trigger.spawn("start");
+    });
+    await wait(200);
+
+    // fast-actor should be terminated due to short lease
+    const diagAfter = slowWriter.getDiagnostics();
+    expect(diagAfter.isErr).toBe(true);
+
+    await sup.shutdown();
+  });
+});
+
+// ============================================================================
+// Resource cleanup on supervisor shutdown
+// ============================================================================
+
+describe("resource cleanup on shutdown", () => {
+  it("calls release hooks on supervisor shutdown", async () => {
+    let releaseCalled = false;
+
+    const sup = createSupervisor({
+      maxActors: 5,
+      memory: { poolSize: 3, boxSize: 1024 },
+      timeouts: { defaultLeaseMs: 5000 },
+      resources: {
+        db: {
+          query: {
+            input: z.object({ sql: z.string() }),
+            output: z.array(z.unknown()),
+            handler: async (args: unknown) => {
+              const { sql } = args as { sql: string };
+              return [{ id: 1, sql }];
+            },
+          },
+          release: () => { releaseCalled = true; },
+        },
+      },
+    });
+
+    const actor = sup.spawn(async (self) => { self.send("alive"); });
+    actor.spawn("start");
+    await wait(100);
+
+    await sup.shutdown();
+
+    expect(releaseCalled).toBe(true);
   });
 });

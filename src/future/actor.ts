@@ -1,4 +1,4 @@
-import type { Result } from "../result";
+import type { Result } from "slang-ts";
 import type {
   ActorId,
   ActorDiagnostics,

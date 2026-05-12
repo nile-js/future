@@ -1,7 +1,6 @@
-import { Ok, Err } from "../result";
-import type { Result } from "../result";
+import { Ok, Err, safeTry } from "slang-ts";
+import type { Result } from "slang-ts";
 import type { ActorRef } from "./types";
-import { safeTry } from "../safe-try";
 
 // ============================================================================
 // Backoff Calculation

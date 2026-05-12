@@ -52,6 +52,7 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "slang-ts": "^0.0.7",
     "zod": "^3.23.0"
   }
 }

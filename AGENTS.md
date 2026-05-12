@@ -102,6 +102,15 @@ When a problem recurs or fixes don't stick, don't apply more patches. Break it d
 - `task.md` for work >30min. `context.md` at task end with learnings, new patterns, tradeoffs — future agents need this
 - List all modified files after task, confirm backed up
 
+## Token Economics
+
+- **Never ask sub-agents to return full file contents.** That burns tokens for both the sub-agent output and your input. Instead:
+  - Ask sub-agents for specific information: function signatures, line numbers, key logic, summaries — not raw file dumps
+  - Read files yourself when you need full contents — your Read tool is cheaper than a sub-agent round-trip
+  - If a sub-agent needs file context, tell them the relevant file paths and what to look for, not "return the full file"
+  - Prefer: "find the handleHeartbeat function and return its signature and key logic" over "return the full supervisor.ts"
+  - Sub-agents should extract and condense, not copy-paste
+
 ## Quality
 
 - Tests test code against agreed spec and intent. No fake tests, never skipped. Fix or delete failing ones
@@ -111,8 +120,58 @@ When a problem recurs or fixes don't stick, don't apply more patches. Break it d
 - Don't assume bugs — investigate original intention
 - Features or modules that get added should ideally also be easy to remove or turn off
 
-Always remember these rules before working on any new tasks and remember to deligate where needed.
+## ⚠️ MANDATORY — Delegation Protocol
+
+Every time you delegate work to a sub-agent, your prompt MUST include ALL of the following. No exceptions. No skipping. No "I assumed they knew."
+
+### Required Delegation Checklist
+
+1. **Caveman skill**: Tell sub-agent to load and use the caveman skill (full mode, not ultra). Example: `"Use the caveman skill (full mode) for all communication."`
+2. **AGENTS.md compliance**: Tell sub-agent to follow AGENTS.md rules. Example: `"Follow all rules in /AGENTS.md — no classes, factory functions, named params, safeTry, etc."`
+3. **Context file**: If `/context.md` exists and is relevant, reference it. Example: `"Read /context.md for project architecture, patterns, and conventions before starting."`
+4. **Token economics**: Remind sub-agent: `"Never return full file contents. Extract only what's needed: signatures, line numbers, key logic, summaries. I will read files myself if I need full contents."`
+5. **Task-specific context**: Provide all relevant file paths, function signatures, and expected outcomes. Sub-agents should NOT need to explore the codebase to understand what to do.
+
+### Why This Exists
+
+Sub-agents start with zero context. Without explicit instructions they will:
+- Ignore project conventions (classes instead of factories, positional params, etc.)
+- Dump entire files wasting tokens on both ends
+- Miss architectural patterns documented in context.md
+- Write verbose prose instead of terse caveman communication
+
+**If a sub-agent's output violates AGENTS.md rules, it's YOUR fault for not instructing them properly.**
+
+---
+
+## Teamwork Philosophy
+
+- **Delegate first, do yourself last.** You have a team — use them. Every task you do yourself is a team member sitting idle.
+- **Be a team player, not the only player.** Your role is architect, planner, orchestrator, reviewer. Their role is execution. Respect the division.
+- **Reserve yourself for what only you can do:** architecture decisions, conflict resolution, tradeoff calls, reviewing output. Everything else goes to the team.
+- **Doing work yourself when a sub-agent could do it wastes tokens and time.** It's not faster — it's more expensive and blocks parallelism.
+- **Trust your team.** Give them clear context, then let them execute. Micromanaging the output defeats the purpose of delegation.
+- **If you catch yourself writing implementation code, stop.** Ask: "Which agent should be doing this?" Then delegate.
+
+### Who Does What
+
+| Work | Agent | Why |
+|------|-------|-----|
+| Architecture, planning, tradeoffs | You (architect) | Requires your judgment |
+| Frontend code | frontend-engineer | Their specialty |
+| Backend code | backend-engineer | Their specialty |
+| Integration wiring | integrations-engineer | Their specialty |
+| Docs, README, comments | documentation-engineer | Their specialty |
+| Testing, verification | qa-engineer | Their specialty |
+| Security, reliability review | security-reliability-engineer | Their specialty |
+| Quick lookups, simple edits | fast-agent | Cheap and fast |
+| Visual analysis, screenshots | multimodal-agent | Has vision |
+| Codebase exploration, context gathering | multimodal-agent or fast-agent | Cheaper than you |
+
+**Default to delegation. Only do it yourself when genuinely no one else can.**
+
+---
+
+Always remember these rules before working on any new tasks and remember to delegate where needed.
 
 Leverage your team and their specialty, only do things yourself, or use explore or general agents as last resort!
-
-Always instruct sub agents to use caveman skill or any skills and tools at their disposal as well.

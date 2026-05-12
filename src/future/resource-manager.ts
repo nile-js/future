@@ -1,5 +1,5 @@
 import type { ResourcesConfig } from "./types";
-import { safeTry } from "../safe-try";
+import { safeTry } from "slang-ts";
 
 /**
  * Main-thread resource registry. Validates input/output with Zod.

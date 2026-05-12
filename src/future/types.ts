@@ -1,4 +1,4 @@
-import type { Result } from "../result";
+import type { Result } from "slang-ts";
 
 /** Unique actor identifier — string for debuggability and hash-map keys */
 export type ActorId = string;
@@ -41,7 +41,7 @@ export type ChainableReader = {
   readonly binary: () => Uint8Array; readonly cbor: () => unknown; readonly raw: () => Uint8Array;
 };
 
-/** FormatUtils — encoding/decoding on ctx.fmt. Typed alloc sub-methods allocate SAB-backed views. */
+/** FormatUtils — encoding/decoding on ctx.fmt. Typed alloc sub-methods create heap buffers (copied into SAB on write). */
 export type FormatUtils = {
   readonly from: (data: string | object | Uint8Array) => Uint8Array;
   readonly encode: (data: unknown) => Uint8Array;
@@ -146,14 +146,12 @@ export type DiagnosticsConfig = {
     readonly inboxDepth?: boolean; readonly refCountHistory?: boolean;
   };
 };
-/** Supervisor config — defaultCodec and codecs allow custom serialization beyond built-ins. */
+/** Supervisor config — core settings for actor system. */
 export type SupervisorConfig = {
   readonly maxActors: number; readonly memory: MemoryConfig;
   readonly resources?: ResourcesConfig; readonly timeouts?: TimeoutConfig;
   readonly strategy?: SupervisionStrategy; readonly retry?: RetryConfig;
   readonly diagnostics?: DiagnosticsConfig;
-  readonly defaultCodec?: FmtType;
-  readonly codecs?: Record<string, { readonly encode: (data: unknown) => Uint8Array; readonly decode: (buf: Uint8Array) => unknown }>;
 };
 
 /** Supervisor — owns all actor refs, manages lifecycle, aggregates diagnostics. */

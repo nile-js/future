@@ -1,6 +1,6 @@
 import type { MainToWorkerMessage, WorkerToMainMessage } from "./types";
-import { safeTry } from "../safe-try";
-import type { Result } from "../result";
+import { safeTry } from "slang-ts";
+import type { Result } from "slang-ts";
 
 // ============================================================================
 // PubSub — Tier 1 message bus

@@ -1,7 +1,6 @@
 import { Worker } from "node:worker_threads";
-import { Ok, Err } from "../result";
-import { safeTry } from "../safe-try";
-import type { Result } from "../result";
+import { Ok, Err, safeTry } from "slang-ts";
+import type { Result } from "slang-ts";
 import { createMemoryPool } from "./memory-pool";
 import { createPubSub, createMessageChannel } from "./pubsub";
 import { createResourceManager } from "./resource-manager";
@@ -322,8 +321,9 @@ export function createSupervisor(config: SupervisorConfig): Supervisor {
     const leaseMs = actorTimeouts[state.config.name ?? ""] ?? defaultLeaseMs;
     entry.expiresAt = Date.now() + leaseMs;
 
-    // Compute authorized readers
+    // Compute authorized readers (exclude writer — they already have the data)
     const readers = computeReaders(actorId, entry.share);
+    readers.delete(actorId); // Writer doesn't need INBOX, never releases
     entry.readers = readers;
     entry.refCount = readers.size;
 
@@ -331,7 +331,6 @@ export function createSupervisor(config: SupervisorConfig): Supervisor {
 
     // Deliver INBOX to authorized readers
     for (const readerId of readers) {
-      if (readerId === actorId) continue; // Writer already has the data
       const readerState = actors.get(readerId);
       if (!readerState || readerState.terminated) continue;
 
