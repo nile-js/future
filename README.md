@@ -4,19 +4,21 @@ High-performance actor and task primitives for Typescript, inspired by Erlang
 
 ## Why Future?
 
-Imagine you have a function that processes a file. It works. Then one day it hangs, not crashes, not throws, just sits there consuming memory and holding connections. The event loop is frozen. Your server stops responding. `AbortController` will not save you; it just stops you from waiting while the code keeps running in the background.
+Imagine you have a function that processes a file. It works. Then one day it hangs, not crashes, not throws, just sits there consuming memory and holding connections. The event loop is frozen. Your server stops responding. And `AbortController` will not save you; it just stops you from waiting while the code keeps running in the background, you basically just ignore to wait for the results, the execution continues.
 
 In a standard JavaScript runtime, you have no way to stop it. No way to reclaim the memory. No way to know what went wrong. You restart the process and hope it does not happen again.
 
-Future changes this. Every piece of work runs in its own thread with its own memory. If it hangs, you kill it. Not politely, the thread dies, memory is freed, and the rest of your system keeps running. You can do this from anywhere: a timeout, a user action, a monitoring signal. The actor stops, resources clean up, and nothing else is affected.
+Future changes this. Every piece of work runs in its own threads called actors with its own memory. If it hangs, you kill it on demand like a trigger, the thread dies, memory is freed, and the rest of your system keeps running. You can do this from anywhere: a timeout, a user action, a monitoring signal. The actor stops, resources clean up, and nothing else is affected.
 
-That is the core promise: **run anything, kill it anytime, clean up automatically**.
+Future makes sure the actors are light and pretty optimized so the system doesn't become so memory hungry and we lose the benefits of doing all this to begin with. This is achieved via 2 tier communication mechanisms between actors where 1 is lighter and default and 2 is zero copy shared immuatable memory strategy which maximum optimization and control and predictable scaling.
+
+The core promise is: **future brings battle tested erlang fault tolerence, self healing and concurrency to javascript so you can run anything, kill it anytime, clean up automatically and restart on failure without dealing with underlying complexity**.
 
 ## What You Can Build
 
-Future is not just actors. It is a complete concurrency toolkit:
+Future is not just actors. It is a complete concurrency system:
 
-- **Parallel workloads**: Run hundreds of tasks simultaneously, each in its own thread. One slow task never blocks another.
+- **Parallel workloads**: You can run hundreds of tasks simultaneously, each in its own thread. One slow task never blocks another.
 - **Shared memory at zero cost**: Pass large data between threads without copying. Write once, read from anywhere, no serialization overhead.
 - **Self-healing systems**: Actors fail, the supervisor restarts them. Link dependent actors so they recover together. Monitor what matters and react to failures.
 - **Safe resource access**: Workers call databases, APIs, and filesystems through a proxy that validates every input and output. Nothing touches the main thread directly.
