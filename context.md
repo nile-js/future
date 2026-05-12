@@ -186,7 +186,7 @@ const inboxes: Map<ActorId, InboxEntry[]>;
 - If Node.js support is needed, it requires a pre-compiled worker bootstrap or `tsx` loader — not currently implemented.
 
 ## Documentation Status
-- `README.md` — Simplified overview (267 lines). Deep dives moved to /docs.
+- `README.md` — Simplified overview (273 lines). Motivational briefing, featured example, quick features, Erlang inspiration. Deep dives linked.
 - `docs/architecture.md` — Worker model, memory pool, state machine, performance, slang-ts
 - `docs/shared-memory.md` — Tier 2, write/read/release, authorization, lease, buffer, lock
 - `docs/supervision.md` — Strategies, groups, linking, monitoring, child actors, termination, backoff
