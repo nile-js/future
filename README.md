@@ -1,10 +1,10 @@
 # Future
 
-High-performance actor and task primitives for typescript inspired by erlang
+High-performance actor and task primitives for Typescript, inspired by Erlang
 
 ## Why Future?
 
-You have a function that processes a file. It works. Then one day it hangs, not crashes, not throws, just sits there consuming memory and holding connections. The event loop is frozen. Your server stops responding. `AbortController` will not save you; it just stops you from waiting while the code keeps running in the background.
+Imagine you have a function that processes a file. It works. Then one day it hangs, not crashes, not throws, just sits there consuming memory and holding connections. The event loop is frozen. Your server stops responding. `AbortController` will not save you; it just stops you from waiting while the code keeps running in the background.
 
 In a standard JavaScript runtime, you have no way to stop it. No way to reclaim the memory. No way to know what went wrong. You restart the process and hope it does not happen again.
 
@@ -270,4 +270,4 @@ MIT License
 
 ## Status
 
-This project is work in progress. APIs may change as the library evolves.
+This project is still work in progress and may not be production ready yet. APIs may change as the library evolves.
