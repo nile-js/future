@@ -1,7 +1,7 @@
 {
   "name": "@nilejs/future",
-  "version": "0.1.0",
-  "description": "High-performance actor and promise primitives for Bun and Node.js inspired by Erlang",
+  "version": "0.0.1",
+  "description": "High-performance actor and task primitives for Typescript, inspired by Erlang",
   "type": "module",
   "main": "dist/index.js",
   "module": "dist/index.js",
@@ -19,13 +19,13 @@
     "typecheck": "tsc --noEmit",
     "build": "bun run test && bun run typecheck && bun run bun-build.ts && tsc -p tsconfig.build.json"
   },
-  "homepage": "https://github.com/Hussseinkizz/slang#readme",
+  "homepage": "https://github.com/nile-js/future#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Hussseinkizz/slang.git"
+    "url": "git+https://github.com/nile-js/future.git"
   },
   "bugs": {
-    "url": "https://github.com/Hussseinkizz/slang/issues"
+    "url": "https://github.com/nile-js/future/issues"
   },
   "keywords": [
     "actor",

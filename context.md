@@ -192,7 +192,7 @@ const inboxes: Map<ActorId, InboxEntry[]>;
 - `docs/supervision.md` — Strategies, groups, linking, monitoring, child actors, termination, backoff
 - `docs/diagnostics.md` — Configuration reference, sampling, per-actor and supervisor metrics
 - `docs/resources.md` — Intent relay, schema validation, cleanup hooks
-- `spec-final.md` — Canonical spec (1400 lines, 20 sections, 8 ADRs)
+- `spec.md` — Canonical spec (1400 lines, 20 sections, 8 ADRs)
 - `docs/ADR-006-bun-only-runtime.md` — Bun-only runtime decision
 - `context.md` — Project context (this file)
 
