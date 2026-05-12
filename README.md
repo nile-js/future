@@ -1,6 +1,6 @@
 # Future
 
-Run code in parallel, safely. Isolated actors, zero-copy shared memory, and self-healing fault tolerance for TypeScript, inspired by Erlang.
+High-performance actor and task primitives for typescript inspired by erlang
 
 ## Why Future?
 
